@@ -3,13 +3,18 @@ from qiime2.plugin import (Plugin, Citations,
                            Categorical)
 
 # from skbio.stats.distance import DistanceMatrix
+from q2_types.ordination import PCoAResults
 from q2_types.feature_table import (FeatureTable,
                                     Frequency,
                                     RelativeFrequency)
+
 from q2_types.distance_matrix import DistanceMatrix
 from q2_types.tree import (Phylogeny, Rooted)
 
 from q2_haarlikedist._methods import haar_like_dist
+
+from q2_haarlikedist._type import Modmags
+from q2_haarlikedist._format import ModmagsFormat, ModmagsDirFormat
 
 citations = Citations.load('citations.bib', package='q2_haarlikedist')
 
@@ -24,6 +29,11 @@ plugin = Plugin(
     short_description='Plugin for haar-like distance.',
 )
 
+plugin.register_formats(ModmagsFormat, ModmagsDirFormat)
+plugin.register_semantic_types(Modmags)
+plugin.register_semantic_type_to_format(
+    Modmags,
+    artifact_format=ModmagsDirFormat)
 
 plugin.methods.register_function(
     function=haar_like_dist,
@@ -38,7 +48,8 @@ plugin.methods.register_function(
     outputs=[
         ('distance_matrix', DistanceMatrix),
         ('annotated_tree', Phylogeny[Rooted]),
-        ('modmags', FeatureTable[Frequency])
+        ('modmags', FeatureTable[Frequency]),
+        ('pcoa', PCoAResults)
     ],
     input_descriptions={
         'phylogeny': (
@@ -65,7 +76,9 @@ plugin.methods.register_function(
             ('A feature table which can be seen as '
              'a differential encoding. Distances can be '
              'calculated from this matrix in several different '
-             'ways.')
+             'ways.'),
+        'pcoa':
+            ('PCoA plot of the distance matrix.')
     },
     name='haarlikedist',
     description='Computes haar-like-distance between samples.',
@@ -73,3 +86,5 @@ plugin.methods.register_function(
         citations['Gorman2022'],
     ]
 )
+
+importlib.import_module('q2_haarlikedist._transformer')
