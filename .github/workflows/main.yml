@@ -49,11 +49,13 @@ jobs:
         shell: bash -l {0}
         run: pip install -e .
 
+      - name: Run tests & coverage
+        shell: bash -l {0}
+        run: nosetests -v q2_haarlikedist --with-coverage --cover-package=q2_haarlikedist
+
       - name: Check style
         shell: bash -l {0}
         run: flake8 q2_haarlikedist/*.py q2_haarlikedist/tests/*.py setup.py
 
-      - name: Run tests & coverage
-        shell: bash -l {0}
-        run: nosetests -v q2_haarlikedist --with-coverage --cover-package=q2_haarlikedist
+
 
