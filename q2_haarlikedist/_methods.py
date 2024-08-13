@@ -7,13 +7,29 @@
 # ----------------------------------------------------------------------------
 
 import skbio
+import qiime2
+import biom
+import numpy as np
+import os
+
 from skbio import read
 from skbio.tree import TreeNode
 from skbio.stats.distance import DistanceMatrix
-from scipy.sparse import csr_matrix, lil_matrix
-import numpy as np
-import biom
+from skbio.stats.ordination import OrdinationResults
+from skbio.stats.ordination import pcoa
+
+from scipy.sparse import csr_matrix, csc_matrix, lil_matrix
+from scipy.spatial import distance
+
+
+import q2templates
 from qiime2 import CategoricalMetadataColumn as Column
+from qiime2 import Metadata
+
+from pkg_resources import resource_filename
+
+
+from ._adaptive import *
 
 
 def get_tree_from_file(tree_file):
@@ -64,20 +80,17 @@ def get_case(node):
         4 possible child layouts; returns string describing the case.
         Neither => neither child is a tip etc. """
 
-    left_is_tip = not node.children[0].has_children()
-    right_is_tip = not node.children[1].has_children()
+    l_is_tip = not node.children[0].has_children()
+    r_is_tip = not node.children[1].has_children()
 
-    if not left_is_tip and not right_is_tip:
-        return 'neither'
+    case = {
+        (False, False): "neither",
+        (False, True): "right",
+        (True, False): "left",
+        (True, True): "both"
+    }
 
-    if left_is_tip and right_is_tip:
-        return 'both'
-
-    if left_is_tip and not right_is_tip:
-        return 'left'
-
-    if not left_is_tip and right_is_tip:
-        return 'right'
+    return case[(l_is_tip, r_is_tip)]
 
 
 def get_nontip_index(node, side):
@@ -192,11 +205,26 @@ def handle_both(node, lilmat, shl, i):
 
 
 def create_branching_tree(t2, lilmat, shl):
-    """ Returns lilmat, shl represented as two branching trees. """
-    mastersplit = t2.children
+    """ Returns lilmat, shl represented as two branching trees. 
+        This will allow the number of internal nodes to 
+        match the number of tips. 
+        
+        NOTE: ntips0 and ntips1 are defined as 1 in the case
+        that a root's child is a tip. Otherwise this would
+        assign 0 causing division by 0 errors for values0,
+        or values 1
+        """
+    
+    child0, child1 = t2.children
 
-    ntips0 = len([x for x in mastersplit[0].tips()])
-    ntips1 = len([x for x in mastersplit[1].tips()])
+    ntips0 = len([x for x in child0.tips()])
+    ntips1 = len([x for x in child1.tips()])
+    ntips0 = max(ntips0, 1)
+    ntips1 = max(ntips1, 1)
+
+    if ntips0 + ntips1 != shl[0].shape[1]:
+        m = 'Number of tips inconsistent between tree and shl matrix'
+        raise ValueError(m)
 
     values0 = np.repeat(1/np.sqrt(ntips0), ntips0)
     zeros0 = np.repeat(0, ntips1)
@@ -215,11 +243,14 @@ def create_branching_tree(t2, lilmat, shl):
 
 
 def sparsify(t2):
+    """ Sparsifies a tree and returns lilmat, shl.
+        Represents tree as matrices. """
 
     t2, shl, lilmat = initiate_values(t2)
 
     traversal = t2.non_tips(include_self=True)
     for i, node in enumerate(traversal):
+        
         case = get_case(node)
 
         if case == 'neither':
@@ -246,7 +277,7 @@ def get_lambda(lilmat, shl, i):
     lstar = lilmat[i].todense().T
     phi = shl[i].todense()
     phi2 = np.multiply(phi, phi)
-    lambd = np.dot(phi2, lstar)
+    lambd = phi2.dot(lstar)
     return lambd
 
 
@@ -262,13 +293,16 @@ def get_lambdas(lilmat, shl):
 
 def match_to_tree(table, tree):
     """ Returns aligned data in biom format.
-        data_file must be a biom table. """
+        table: biom.Table.
+        tree: skbio.TreeNode. """
+    
+    table = table.norm(inplace=False)
+    biomtab, tree = table.align_tree(tree)
+    ids = biomtab.ids()
+    table = biomtab.matrix_data.tocsr()
+    tree.bifurcate(0)
 
-    table = table.norm()
-    table, tree = table.align_tree(tree)
-    ids = table.ids()
-    table_matrix = table.matrix_data.tocsr()
-    return table, tree, ids, table_matrix
+    return table, tree, ids, biomtab
 
 
 def compute_haar_dist(table, shl, diagonal):
@@ -279,103 +313,105 @@ def compute_haar_dist(table, shl, diagonal):
     diagonal_mat_sqrt = np.sqrt(diagonal_mat)
     mags = shl @ table
     modmags = mags.T.multiply(diagonal_mat_sqrt)
-    ones = csr_matrix(np.ones((nsamples, 1)))  # 1's csr_matrix for casting
 
-    D = np.zeros((nsamples, nsamples))
+    # compute the distance matrix
+    D = lil_matrix((nsamples, nsamples))  # Blank dist matrix
+    mat = csr_matrix(np.ones((nsamples, 1)))  # Blank csr_matrix for broadcast
     for i in range(nsamples):
-        a = modmags - modmags[i, :].multiply(ones)
+        a = modmags - modmags[i, :].multiply(mat)
         b = csr_matrix.power(a, 2)
         c = csr_matrix.sum(b, axis=1)
         d = np.sqrt(c)
         D[i, :] = csr_matrix(d.T)
 
     D = D + D.T
+
+    # Check if D is symmetric
+    print(D)
+    assert (D != D.T).nnz == 0
+
     return D, modmags
 
 
-def format_tree(tree, modmags):
-    """ Formats tree for output.
-        Saves number of times node is most significant
-        as a node name and returns tree. """
-
-    nontips = [node for node in tree.non_tips(include_self=True)]
-    n = np.shape(modmags)[0]
-    m = np.shape(modmags)[1]
-    node_weights = np.zeros(m)
-    for i in range(n):
-        for j in range(i):
-            if i != j:
-                diff = modmags[i] - modmags[j]
-                diff = [np.abs(d) for d in diff.todense()]
-                d = np.array(diff)[0][0]
-                node_weights += d
-
-    # node_weights = [np.log(x) for x in node_weights]
-    node_weights = node_weights / sum(node_weights)
-    for i, node in enumerate(nontips):
-        node.length = np.round(node_weights[i], 4)
-        node.name = str(node.length)
-
-    nontips[-1].name = '0'
-
-    return tree
-
-
-def format_tree_meta(tree, modmags, metadata_col, metadata_val):
-    """ Formats tree for output.
-        Saves number of times node is most significant
-        as a node name and returns tree. """
-
-    nontips = [node for node in tree.non_tips(include_self=True)]
-    for node in nontips:
-        node.max_modmag = 0
-
-    m = np.shape(modmags)[1]
-    node_weights = np.zeros(m)
-
-    # Construct the indices of the two groups to prepare
-    col = metadata_col.to_series()
-    vals = [x[0] for x in col.values]
-    i_ind = [i for i, x in enumerate(vals) if x == metadata_val]
-    j_ind = [x for x in range(m) if x not in i_ind]
-
-    for i in i_ind:
-        for j in j_ind:
-            diff = modmags[i] - modmags[j]
-            diff = [np.abs(d) for d in diff.todense()]
-            d = np.array(diff)[0][0]
-            node_weights += d
-
-    for i, node in enumerate(nontips):
-        node.length = np.round(node_weights[i], 4)
-        node.name = str(node.length)
-
-    nontips[-1].name = '0'
-
-    return tree
-
-
 def haar_like_dist(table: biom.Table,
-                   phylogeny: skbio.TreeNode,
-                   group_column: Column = None,
-                   group_value: str = None) \
+                   tree: skbio.TreeNode) \
                    -> (DistanceMatrix, skbio.TreeNode,
-                       biom.Table):
+                       csr_matrix, OrdinationResults): # type: ignore
     """ Returns D, tree, mm. Distance matrix and significance.
         Returns distance matrix and formatted tree.
         This now returns modmags as a biom table, which
         can be thought of as a differentially encoded
         feature table. """
 
-    table, tree, ids, table_matrix = match_to_tree(table, phylogeny)
+    table, tree, ids, biomtab = match_to_tree(table, tree)
     lilmat, shl = sparsify(tree)
     diagonal = get_lambdas(lilmat, shl)
-    D, modmags = compute_haar_dist(table_matrix, shl, diagonal)
-    D = DistanceMatrix(D, ids)
-    if group_column is not None and group_value is not None:
-        tree = format_tree_meta(tree, modmags, group_column, group_value)
-    else:
-        tree = format_tree(tree, modmags)
-    mm = biom.Table(modmags, observation_ids=[], sample_ids=[])
+    print(type(diagonal))
+    D, modmags = compute_haar_dist(table, shl, diagonal)
+    D = DistanceMatrix(np.array(D.todense()))
+    mm = csr_matrix(modmags)  # Going to see if this works w new format
+    p = pcoa(D)
 
-    return D, tree, mm
+    return D, tree, mm, p
+
+def adaptive_visual(
+        output_dir: str,
+        table: biom.Table,
+        tree: skbio.TreeNode,
+        label: str,
+        metadata: Metadata,
+    ) -> None:
+
+    table, tree, ids, biomtab = match_to_tree(table, tree)
+    meta = _validate(metadata, label, biomtab)
+    lilmat, shl = sparsify(tree)
+    adhld_results = adaptive(shl, table, label, biomtab, meta, s=5)
+
+    signal, dictionary, rfrgam, mpresults, coordinates, \
+        coefs, importances, R, diagonal, new_impo, X, Y, dic = adhld_results
+
+    D, modmags = compute_haar_dist(table, shl, diagonal)
+    modmags = modmags.T
+
+    q2_dmat = save_distance(D, ids, output_dir)
+    q2_tree = save_tree(tree, output_dir)
+    make_plots(adhld_results, modmags, output_dir)
+
+    context = {
+        'dmat': q2_dmat,
+        'tree': q2_tree
+    }
+    
+    # VISUALIZER
+    TEMPLATES = resource_filename(
+        'q2_haarlikedist', 'adhld_assets')
+    index = os.path.join(TEMPLATES, 'index.html')
+    q2templates.render(index, output_dir, context=context)
+
+
+def adaptive_distance(
+        table: biom.Table,
+        tree: skbio.TreeNode,
+        label: str,
+        metadata: Metadata,
+    ) -> (skbio.DistanceMatrix,
+          skbio.TreeNode,
+          csr_matrix,
+          OrdinationResults): # type: ignore
+
+    table, tree, ids, biomtab = match_to_tree(table, tree)
+    meta = _validate(metadata, label, biomtab)
+    lilmat, shl = sparsify(tree)
+    adhld_results = adaptive(shl, table, label,
+                             biomtab, meta, s=5)
+
+    signal, dictionary, rfrgam, mpresults, coordinates, \
+        coefs, importances, R, diagonal, new_impo, X, Y, dic = adhld_results
+
+    D, modmags = compute_haar_dist(table, shl, diagonal)
+
+    D = skbio.DistanceMatrix(np.array(D.todense()), ids)
+    mm = csr_matrix(modmags)  # Going to see if this works w new format
+    p = pcoa(D)
+
+    return D, tree, mm, p

@@ -6,6 +6,7 @@ import skbio
 import biom
 from os.path import dirname, abspath, join
 from inspect import currentframe, getfile
+import inspect
 
 from q2_haarlikedist._methods import (initiate_values,
                                       get_case,
@@ -31,6 +32,9 @@ from q2_haarlikedist._methods import (initiate_values,
 class TestSparsify(TestCase):
 
     def setUp(self):
+
+        source_code = inspect.getsource(match_to_tree)
+        print(source_code)
 
         path = dirname(abspath(getfile(currentframe())))
 
