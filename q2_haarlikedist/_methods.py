@@ -10,6 +10,7 @@ import skbio
 import qiime2
 import biom
 import numpy as np
+import pandas as pd
 import os
 
 from skbio import read
@@ -332,6 +333,8 @@ def compute_haar_dist(table, shl, diagonal):
 
     return D, modmags
 
+def make_feature_metadata(tree, taxonomy):
+    return taxonomy
 
 def haar_like_dist(table: biom.Table,
                    tree: skbio.TreeNode) \
@@ -346,7 +349,6 @@ def haar_like_dist(table: biom.Table,
     table, tree, ids, biomtab = match_to_tree(table, tree)
     lilmat, shl = sparsify(tree)
     diagonal = get_lambdas(lilmat, shl)
-    print(type(diagonal))
     D, modmags = compute_haar_dist(table, shl, diagonal)
     D = DistanceMatrix(np.array(D.todense()))
     mm = csr_matrix(modmags)  # Going to see if this works w new format
@@ -354,12 +356,134 @@ def haar_like_dist(table: biom.Table,
 
     return D, tree, mm, p
 
+from collections import defaultdict
+
+def left_children(node):
+    if not node.children[0].is_tip():
+        return [x.name for x in node.children[0].tips()]
+    else:
+        return [node.children[0].name]
+
+def right_children(node):
+    if not node.children[1].is_tip():
+        return [x.name for x in node.children[1].tips()]
+    else:
+        return [node.children[1].name]
+
+def get_taxa(node_name_list, taxonomy, make_set=True):
+    """ node_name_list, taxonomy in dict form, make_set=True """
+    taxa = []
+    for name in node_name_list:
+        try:
+            t = taxonomy[name]
+        except:
+            t = 'not found'
+        taxa.append(t)
+
+    if make_set: taxa = set(taxa)
+
+    return taxa
+
+def get_important_taxa(tree, idx, taxonomy):
+
+    nontips = [x for x in tree.postorder() if not x.is_tip()]
+    node = nontips[idx]
+    l = left_children(node)
+    r = right_children(node)
+
+    l_taxa = get_taxa(l, taxonomy)
+    r_taxa = get_taxa(r, taxonomy)
+
+    return l_taxa, r_taxa
+
+def get_species(tree, coords, taxonomy):
+
+    """ Returns a dictionary of dictionaries with node,
+        left, right as keys each containing list of
+        tip species. Inputs: tree, coordinates. """
+
+    species = defaultdict(dict)
+
+    nontips = [x for x in tree.postorder() if not x.is_tip()]
+    for i, c in enumerate(coords):
+        l, r = get_important_taxa(tree, c, taxonomy)
+        label = f'{nontips[c].name}'
+        keyname = f'coord {i}: {label}'
+        species[keyname]['left'], species[keyname]['right'] = l, r
+
+    return species
+
+
+def find_common_clade(node, taxonomy):
+    """ Taxonomy must be a dict mapping tips to taxonomies """
+    
+    # Get the taxonomy paths for all descendant tips
+    taxonomies = [taxonomy[tip.name].split(';')
+                  for tip in node.tips()
+                  if tip.name in taxonomy]
+    
+    if not taxonomies: # This should only be true for the root or unfound taxa
+        return None
+    
+    # Find the common clade by comparing taxonomy paths
+    common_clade = []
+    for clade_parts in zip(*taxonomies):
+        if all(part == clade_parts[0] for part in clade_parts):
+            common_clade.append(clade_parts[0])
+        else:
+            break
+    
+    # Return the common clade as a semicolon-separated string
+    clade = ';'.join(common_clade) if common_clade else None
+
+    return clade 
+
+
+def annotate_tree(tree, taxonomy):
+    """ Adds the most common taxonomy descendant and postorder position 
+        as names to the tree. Returns tree, taxonomy. """
+
+    nontips = [x for x in tree.postorder(include_self=True) if not x.is_tip()]
+
+    for i, node in enumerate(nontips):
+
+        node.__setattr__('original_name', node.name)
+        node.__setattr__('name', i)
+
+    # Traverse the tree and label internal nodes
+    taxonomy = taxonomy.to_dataframe().reset_index()
+    taxonomy_map = dict(zip(taxonomy['Feature ID'], taxonomy['Taxon']))
+    for node in nontips:
+        common_clade = find_common_clade(node, taxonomy_map)
+        if common_clade:
+            node.name = f'{node.name}: {common_clade}'
+
+    return tree, taxonomy_map
+
+def save_species(species, output_dir):
+
+    s = ''
+    for k, v in species.items():
+        s += f'\n{k}\n'
+        for x in species[k]['left']:
+            s += f'\t\t{x}\n'
+        s += f'\n\t\t~~~~\n'
+        for x in species[k]['right']:
+            s += f'\t\t{x}\n'
+
+    fname = os.path.join(output_dir, 'species.txt')
+    with open(fname, 'w') as f:
+        f.write(s)
+
+    return s
+
 def adaptive_visual(
         output_dir: str,
         table: biom.Table,
         tree: skbio.TreeNode,
         label: str,
         metadata: Metadata,
+        taxonomy: Metadata = None
     ) -> None:
 
     table, tree, ids, biomtab = match_to_tree(table, tree)
@@ -373,15 +497,23 @@ def adaptive_visual(
     D, modmags = compute_haar_dist(table, shl, diagonal)
     modmags = modmags.T
 
-    q2_dmat = save_distance(D, ids, output_dir)
-    q2_tree = save_tree(tree, output_dir)
     make_plots(adhld_results, modmags, output_dir)
 
-    context = {
-        'dmat': q2_dmat,
-        'tree': q2_tree
+    # GET CONTEXT TO SEND TO HTML FILE
+
+    if taxonomy:
+        annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
+        species = get_species(annotated_tree, coordinates, taxonomy)
+    else:
+        species = {'coord 1':'No taxonomy provided'}
+
+    s = save_species(species, output_dir)
+    coords = ' '.join([str(x) for x in coordinates])
+    context = {'coordinates': coords,
+               'label': label,
+               's': s
     }
-    
+
     # VISUALIZER
     TEMPLATES = resource_filename(
         'q2_haarlikedist', 'adhld_assets')
@@ -394,10 +526,12 @@ def adaptive_distance(
         tree: skbio.TreeNode,
         label: str,
         metadata: Metadata,
+        taxonomy: pd.DataFrame = None
     ) -> (skbio.DistanceMatrix,
           skbio.TreeNode,
           csr_matrix,
-          OrdinationResults): # type: ignore
+          OrdinationResults,
+          pd.DataFrame): # type: ignore
 
     table, tree, ids, biomtab = match_to_tree(table, tree)
     meta = _validate(metadata, label, biomtab)
@@ -414,4 +548,6 @@ def adaptive_distance(
     mm = csr_matrix(modmags)  # Going to see if this works w new format
     p = pcoa(D)
 
-    return D, tree, mm, p
+    feature_metadata = make_feature_metadata(tree, taxonomy)
+    feature_metadata = feature_metadata.to_dataframe()
+    return D, tree, mm, p, feature_metadata

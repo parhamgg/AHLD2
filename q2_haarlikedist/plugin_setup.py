@@ -13,6 +13,9 @@ from q2_types.feature_table import (FeatureTable,
 
 from q2_types.distance_matrix import DistanceMatrix
 from q2_types.tree import (Phylogeny, Rooted)
+from q2_types.feature_data import (FeatureData, Taxonomy)
+
+
 
 from q2_haarlikedist._methods import (haar_like_dist,
                                       adaptive_distance,
@@ -84,7 +87,6 @@ plugin.methods.register_function(
     ]
 )
 
-
 plugin.visualizers.register_function(
     function=adaptive_visual,
     inputs={
@@ -94,6 +96,7 @@ plugin.visualizers.register_function(
     parameters={
         'label': Str,
         'metadata': Metadata,
+        'taxonomy': Metadata
     },
     input_descriptions={
         'tree': (
@@ -107,7 +110,9 @@ plugin.visualizers.register_function(
     parameter_descriptions={
         'label': ('Name of metadata column to use '
                   'for group comparisons. Variable of interest'),
-        'metadata': 'Associated metadata that is a superset of samples.'
+        'metadata': 'Associated metadata that is a superset of samples.',
+        'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
+                     'names to species names.')
     },
     name='adaptive-visual',
     description='Computes haar-like-distance between samples using new' \
@@ -126,40 +131,44 @@ plugin.methods.register_function(
     parameters={
         'label': Str,
         'metadata': Metadata,
+        'taxonomy': Metadata
     },
     outputs=[
         ('distance_matrix', DistanceMatrix),
         ('annotated_tree', Phylogeny[Rooted]),
         ('modmags', Modmags),
-        ('pcoa', PCoAResults)
+        ('pcoa', PCoAResults),
+        ('feature_metadata', FeatureData[Taxonomy])
     ],
     input_descriptions={
-        'tree': (
-            'Phylogeny tree associated with table.'
-        ),
-        'table': (
-            'Biom table with samples and matching OTU IDs.'
-        )
+        'tree': ('Phylogeny tree associated with table.'),
+        'table': ('Biom table with samples and matching OTU IDs.')
     },
     parameter_descriptions={
         'label': ('Name of metadata column to use '
                   'for group comparisons. Variable of interest'),
-        'metadata': 'Associated metadata that is a superset of samples.'
+        'metadata': 'Associated metadata that is a superset of samples.',
+        'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
+                     'names to species names.')
     },
     output_descriptions={
         'distance_matrix':
             ('Resulting pairwise distance '
              'matrix computed from modmags.'),
         'annotated_tree':
-            ('Resulting tree with trimmed '
-             'tips used in analysis.'),
+            ('Resulting tree with trimmed tips used in analysis. '
+             'Has annotated internal nodes which match up with '
+             'feature metadata.'),
         'modmags':
             ('A feature table which can be seen as '
              'a differential encoding. Distances can be '
              'calculated from this matrix '
              'in several different ways.'),
         'pcoa':
-            ('PCoA plot of the distance matrix.')
+            ('PCoA plot of the distance matrix.'),
+        'feature_metadata': 
+            ('Metadata file with information on tree tips '
+             'and internal nodes.')
     },
     name='adaptive-distance',
     description='Computes haar-like-distance between samples.',
@@ -168,4 +177,5 @@ plugin.methods.register_function(
     ]
 )
 
-importlib.import_module('q2_haarlikedist._transformer')
+# importlib.import_module('q2_haarlikedist._transformer')
+import q2_haarlikedist._transformer

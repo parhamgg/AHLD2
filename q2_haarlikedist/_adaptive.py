@@ -29,7 +29,8 @@ __all__ = [
     'new_biplot3dnormalized',
     'rfgram_plot',
     'boxplot_plotter',
-    'make_plots'
+    'make_plots',
+    '_get_correlation'
 ]
 
 # ADAPTIVE FNS
@@ -118,7 +119,7 @@ def convert_least_squares(affinity, mags):
 
     # not storing 1-affinity as a matrix for size reasons 
     X_transformed = csr_matrix(embedding.fit_transform(1-affinity))
-    sparsegram = X_transformed@X_transformed.T
+    sparsegram = X_transformed @ X_transformed.T
 
     signal = csr_matrix.reshape(sparsegram,
                                 ((nsamples**2,1)),
@@ -213,6 +214,16 @@ def _validate(metadata, label, biomtab):  # metadata is of type Metadata
 
 
 def adaptive(shl, table, label, biom_table, meta, s=5):
+    """ shl
+        table: biom_table's data, 
+        label: str, column in meta to use 
+        biom_table: biom.Table
+        meta: pd.dataframe
+        s=5
+
+        returns signal, dictionary, rfrgam, mpresults, coordinates,
+        coefs, importances, R, new_diag, new_impo, X, Y, dic
+    """
 
     _dimensions(shl, table)
 
@@ -241,29 +252,41 @@ def adaptive(shl, table, label, biom_table, meta, s=5):
 # RECONSTRUCTING
 
 def reconstruct_coord(coefs, coordinates, mags, s):
-    [d,n]=mags.get_shape()
+    """ This function is for reconstructing and obtaining a vector
+        used in plotting the biplots. The resulting coord is of shape
+        n_internal_nodes_found (default 5) x n_samples (?) """
+    
+    d, n = mags.get_shape()
     print("Reconstructing")
-    Coord=np.sqrt(coefs[0])*mags[coordinates[0],:].todense()
+    coord = np.sqrt(coefs[0]) * mags[coordinates[0],:].todense()
     for i in range(1,s):
-        Coord=np.vstack((Coord,np.sqrt(coefs[i])*mags[coordinates[i],:].todense()))
-    return Coord
+        nodei = np.sqrt(coefs[i]) * mags[coordinates[i],:].todense()
+        coord = np.vstack((coord, nodei))
+    return coord
 
 
 def reconstruct(coordinates, mags, s, coefs):
     """ This function reconstructs the matrix using weights of the
         top coordinates and the modmags matrix, which is the projection
         onto the shl matrix. 
+
+        coordinates: 
+        mags: csr_matrix
+        s: int - number of coordinates to find (default 5)
+        coefs:
+
+        returns 
+        outer: numpy.matrix of shape s x n_samples
     """
-    
-    [d,n]=mags.get_shape()
+    d, n = mags.get_shape() # d=n internal nodes; n=n samples
     print(d, n)
-    outer=np.zeros((n,n))
+    outer = np.zeros((n,n))
     print("Reconstructing")
     for i in range(s):
         print(i)
-        temp=mags[coordinates[i],:].todense()
-        out=np.outer(temp,temp)
-        outer=outer + coefs[i]*out
+        temp = mags[coordinates[i],:].todense()
+        out = np.outer(temp, temp)
+        outer = outer + coefs[i]*out
     return outer
 
 
@@ -335,9 +358,9 @@ def new_biplot3d(s, coefs, coordinates, mags, y, \
     
     plt.title('PCA Biplot')
     ax.grid(False)
-    ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
-    ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
-    ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.set_facecolor('white')
     ax.dist=12
     fig.tight_layout(pad=2)
@@ -410,9 +433,9 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
     ax.set_position([box.x0, box.y0, box.width * 6, box.height])
     plt.title('PCA Biplot Normalized')
     ax.grid(False)
-    ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
-    ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
-    ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+    ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.set_facecolor('white')
     ax.dist=12
     fig.tight_layout(pad=2)
@@ -421,17 +444,98 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
-def rfgram_plot(rfgram, coordinates, modmags, s, coefs,
+def _get_correlation(sorted_rfgram, sorted_reconstructed):
+
+    matrix1 = np.array(sorted_rfgram.todense())
+    matrix2 = sorted_reconstructed
+    corr = np.corrcoef(matrix1.flatten(), matrix2.flatten())[0, 1]
+    return corr
+
+def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save, path):
+    """ rfgram is the representation of the dataset using a trained rf 
+        model, which works by training an RF on all data poins then forming
+        an rf gram matrix. this matrix represents how similar two points are 
+        to eachother by seeing how similarly they are grouped by the decision 
+        trees in the random forest. the reconstructed plot takes our learned
+        haar-like weight vector, which only uses 5 internal nodes to re-
+        represent the data set. if the two plots look similar, this means
+        that our learned weight vector w does a good job of recapitulating the
+        original random forest in a far smaller feature space."""
+
+    reconstructed = reconstruct(coordinates, modmags, s, coefs)
+    groups = list(Y) 
+    inv_dic = {v:k for k, v in dic.items()}
 
     reconstructed = reconstruct(coordinates, modmags, s, coefs)
 
-    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10, 10))
-    axes[0].imshow(rfgram.todense(), vmin=0, vmax=.3, cmap='binary')
-    axes[1].imshow(reconstructed, vmin=0, vmax=.3, cmap='binary')
+    sorted_indices = np.argsort(groups)
+    sorted_groups = np.array(groups)[sorted_indices]
+    group_names = [inv_dic[x] for x in sorted_groups]  # Name for each group
+
+    sorted_rfgram = rfgram[:, sorted_indices][sorted_indices, :]
+
+    sorted_reconstructed = reconstructed[:, sorted_indices][sorted_indices, :]
+    # reconstructed = reconstruct(coordinates, modmags, s, coefs)
+
+    # Create figure and axes
+    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 6))
+
+    # Heatmap 1
+    axes[0].imshow(sorted_rfgram.todense(), vmin=0, vmax=.3, cmap='binary')
     axes[0].xaxis.set_visible(False)
+
+    # Heatmap 2
+    axes[1].imshow(sorted_reconstructed, vmin=0, vmax=.3, cmap='binary')
     axes[1].xaxis.set_visible(False)
-    fig.tight_layout()
+
+    # Create new axes below each heatmap for the group bars
+    # Adjust the position and size to fit the bars
+    group_bar_height = 0.05  # Height of the group bars
+    label_padding = 0.1  # Space between the bar and the label
+    x_0 = axes[0].get_position().x0
+    y_0 = axes[0].get_position().y0
+    ax_group_bar1 = fig.add_axes([axes[0].get_position().x0,
+                                  axes[0].get_position().y0,
+                                  axes[0].get_position().width,
+                                  group_bar_height], frameon=False)
+    ax_group_bar2 = fig.add_axes([axes[1].get_position().x0,
+                                  axes[1].get_position().y0,
+                                  axes[1].get_position().width,
+                                  group_bar_height], frameon=False)
+
+    # Plot the group bars
+    ax_group_bar1.imshow([sorted_groups], aspect='auto', cmap='Set1')
+    ax_group_bar2.imshow([sorted_groups], aspect='auto', cmap='Set1')
+
+    # Hide y-axis and ticks for the group bars
+    ax_group_bar1.set_yticks([])
+    ax_group_bar1.set_xticks([])
+    ax_group_bar2.set_yticks([])
+    ax_group_bar2.set_xticks([])
+
+    # Determine where each group starts and ends
+    unique_groups, start_idx = np.unique(sorted_groups, return_index=True)
+    end_idx = np.append(start_idx[1:], len(sorted_groups))
+
+    # Add vertical group labels centered below each group segment
+    for i, group in enumerate(unique_groups):
+
+        # Center position for the group label
+        center = (start_idx[i] + end_idx[i] -1) / 2
+        print(center, start_idx[i], end_idx[i])
+
+        # Adjust the vertical position of the labels to avoid overlap
+        label_y = 1
+        ax_group_bar1.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
+        ax_group_bar2.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
+
+    corr_coeff = _get_correlation(sorted_rfgram, sorted_reconstructed)
+    text = f'Pearson Correlation: {corr_coeff:.2f}'
+    axes[1].text(1.1, 0.5, text, fontsize=12, va='center', ha='left', transform=axes[1].transAxes)
+    # Adjust layout to fit the labels
+    plt.subplots_adjust(bottom=0.2)  # Increase bottom margin to accommodate labels
+
 
     if save == True:
         plt.savefig(path, dpi=400, bbox_inches='tight')
@@ -459,7 +563,7 @@ def boxplot_plotter(mags, y, indices, dic,
                              vert=True,  # vertical box alignment
                              patch_artist=True,  # fill with color
                              labels=xlabels)  # will be used to label x-ticks
-        ax[k].set_title('Haar-like Coordinate' + ' ' + str(indices[k]))
+        ax[k].set_title('Haar-like Node' + ' ' + str(indices[k]))
         plt.setp(temp['whiskers'], color='black')
         plt.setp(temp['medians'], color='black')
         plt.setp(temp['fliers'], color='black', marker='')
@@ -492,7 +596,7 @@ def make_plots(adhld_results, modmags, path, s=5):
     path4 = os.path.join(path, 'biplotn.svg')
     
     # RF GRAM MATRIX
-    rfgram_plot(rfgram, coordinates, modmags, s, coefs,
+    rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save=True, path=path1)
 
     # BOXPLOTS OF NODES
