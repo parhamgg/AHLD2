@@ -483,21 +483,27 @@ def adaptive_visual(
         tree: skbio.TreeNode,
         label: str,
         metadata: Metadata,
+        nsubsamples: int = None,
         taxonomy: Metadata = None
     ) -> None:
 
     table, tree, ids, biomtab = match_to_tree(table, tree)
     meta = _validate(metadata, label, biomtab)
     lilmat, shl = sparsify(tree)
-    adhld_results = adaptive(shl, table, label, biomtab, meta, s=5)
 
-    signal, dictionary, rfrgam, mpresults, coordinates, \
-        coefs, importances, R, diagonal, new_impo, X, Y, dic = adhld_results
+    if nsubsamples == None:
+        nsubsamples = len(meta)
 
-    D, modmags = compute_haar_dist(table, shl, diagonal)
+    adhld_results = adaptive(shl, table, label, biomtab, meta, nsubsamples, s=5)
+
+    signal, dictionary, rfgram, mpresults, coordinates, \
+        coefs, importances, R, new_diag, new_impo, X, Y, dic, \
+            subsamples, sub_mags, Y_sub = adhld_results
+
+    D, modmags = compute_haar_dist(table, shl, new_diag)
     modmags = modmags.T
 
-    make_plots(adhld_results, modmags, output_dir)
+    make_plots(adhld_results, sub_mags, output_dir)
 
     # GET CONTEXT TO SEND TO HTML FILE
 

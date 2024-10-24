@@ -12,11 +12,13 @@ from sklearn.manifold import MDS
 from sklearn.preprocessing import normalize, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 
 __all__ = [
     'preprocess',
     'proximity_matrix',
     'spouter',
+    'get_subsamples',
     'convert_least_squares',
     'matching_pursuit',
     'diag_impo',
@@ -27,12 +29,11 @@ __all__ = [
     'reconstruct',
     'new_biplot3d',
     'new_biplot3dnormalized',
+    '_get_correlation',
     'rfgram_plot',
-    'boxplot_plotter',
     'make_plots',
-    '_get_correlation'
+    'boxplot_plotter'
 ]
-
 # ADAPTIVE FNS
 
 def preprocess(label, biomtab, shl, meta):
@@ -100,34 +101,45 @@ def spouter(A, B):
     return csr_matrix((np.concatenate(data), np.concatenate(indices), indptr),
                       (N, L * K))
 
+def get_subsamples(nsubsamples, Y):
 
-def convert_least_squares(affinity, mags):
+    size = nsubsamples / len(Y)
+    x = np.arange(len(Y))
+    _, test_indices = train_test_split(x, test_size=size, stratify=Y,
+                                       random_state=1)
+    return test_indices
 
-    """ Parameters:
-        affinity: rf affinity matrix
-        mags: same mags from before
-        
-        Returns:
-        signal: a n_otus x n_samples**2 
-                 vector of all the sample mapping to the forest
-        A: a csc_matrix which is something??? 
+def convert_least_squares(affinity, mags, nsubsamples, Y, dic):
+    """ returns:
+        signal : a n_otus x n_samples**2 vector of all the sample mapping to the forest
+        A : a csc_matrix which is something??? 
         sparsegram : transformed signals? some sort of mapping
-    """
+
+        input:
+        affinity : rf affinity matrix
+        mags : same mags from before
+        mags, not sure, this didn't really change """
 
     embedding = MDS(n_components=50,dissimilarity='precomputed')
     nsamples = mags.shape[1]
 
-    # not storing 1-affinity as a matrix for size reasons 
-    X_transformed = csr_matrix(embedding.fit_transform(1-affinity))
-    sparsegram = X_transformed @ X_transformed.T
+    subsamples = get_subsamples(nsubsamples, Y)
+    affinity = affinity[np.ix_(subsamples, subsamples)]
+    Y_sub = [Y[i] for i in range(len(Y)) if i in subsamples]
+    print('Y-sub ', Y_sub)
 
+    # not storing 1-affinity as a matrix for size reasons 
+    X_transformed = csr_matrix(embedding.fit_transform(1 - affinity))
+    sparsegram = X_transformed@X_transformed.T
+    print(sparsegram.shape)
     signal = csr_matrix.reshape(sparsegram,
-                                ((nsamples**2,1)),
+                                ((nsubsamples**2,1)),
                                 order='F')
-    C = spouter(mags, mags)
+    sub_mags = mags[:,subsamples]
+    C = spouter(sub_mags, sub_mags)
     A = csc_matrix(C.T)
 
-    return signal, A, sparsegram
+    return signal, A, sparsegram, subsamples, sub_mags, Y_sub
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -213,12 +225,13 @@ def _validate(metadata, label, biomtab):  # metadata is of type Metadata
     return meta
 
 
-def adaptive(shl, table, label, biom_table, meta, s=5):
+def adaptive(shl, table, label, biom_table, meta, nsubsamples, s=5):
     """ shl
         table: biom_table's data, 
         label: str, column in meta to use 
         biom_table: biom.Table
         meta: pd.dataframe
+        nsubsamples: number of subsamples for large datasets
         s=5
 
         returns signal, dictionary, rfrgam, mpresults, coordinates,
@@ -238,16 +251,17 @@ def adaptive(shl, table, label, biom_table, meta, s=5):
     # s = 4 # number of important nodes to find
     rfaffinity = proximity_matrix(clf, X)
 
-    signal, dictionary, rfrgam = convert_least_squares(rfaffinity, mags)
+    signal, dictionary, rfgram, subsamples, sub_mags, Y_sub = \
+        convert_least_squares(rfaffinity, mags, nsubsamples, Y, dic)
+    
     signal = csc_matrix(signal)
 
     mpresults = matching_pursuit(signal, dictionary, s)
     coordinates, coefs, importances, R = mpresults
     new_diag, new_impo = diag_impo(mags, coordinates, importances, coefs)
 
-    return signal, dictionary, rfrgam, mpresults, coordinates, \
-        coefs, importances, R, new_diag, new_impo, X, Y, dic
-
+    return signal, dictionary, rfgram, mpresults, coordinates, \
+        coefs, importances, R, new_diag, new_impo, X, Y, dic, subsamples, sub_mags, Y_sub
 
 # RECONSTRUCTING
 
@@ -294,7 +308,10 @@ def reconstruct(coordinates, mags, s, coefs):
 
 def new_biplot3d(s, coefs, coordinates, mags, y, \
                  labeltype,dic,k,n,save,path):
+    
+    print('starting new biplot')
     Z=np.transpose(reconstruct_coord(coefs, coordinates, mags, s))
+    print('finished the transpose')
     pca = PCA()
     x_new = pca.fit_transform(np.asarray(Z))
     score = x_new[:,0:3]
@@ -371,7 +388,9 @@ def new_biplot3d(s, coefs, coordinates, mags, y, \
 
 def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
                            labeltype, dic, k, n, save, path):
+    print('in making new biplot')
     Z = np.transpose(reconstruct_coord(coefs, coordinates, mags, s))
+    print('reconstructed for Z')
     scaler = StandardScaler()
     scaler.fit(np.asarray(Z))
     Z = scaler.transform(np.asarray(Z))  
@@ -451,7 +470,7 @@ def _get_correlation(sorted_rfgram, sorted_reconstructed):
     corr = np.corrcoef(matrix1.flatten(), matrix2.flatten())[0, 1]
     return corr
 
-def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
+def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic, subsamples,
                 save, path):
     """ rfgram is the representation of the dataset using a trained rf 
         model, which works by training an RF on all data poins then forming
@@ -463,12 +482,13 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
         that our learned weight vector w does a good job of recapitulating the
         original random forest in a far smaller feature space."""
 
-    reconstructed = reconstruct(coordinates, modmags, s, coefs)
-    groups = list(Y) 
+    print('here')
+    groups = list(Y) #np.array([1, 2, 1, 3, 2, 1, 3, 2, 1, 3])  # Example group labels
+    groups = np.array(list(Y))[subsamples]
     inv_dic = {v:k for k, v in dic.items()}
 
     reconstructed = reconstruct(coordinates, modmags, s, coefs)
-
+    print('here, reconstructed')
     sorted_indices = np.argsort(groups)
     sorted_groups = np.array(groups)[sorted_indices]
     group_names = [inv_dic[x] for x in sorted_groups]  # Name for each group
@@ -493,16 +513,8 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
     # Adjust the position and size to fit the bars
     group_bar_height = 0.05  # Height of the group bars
     label_padding = 0.1  # Space between the bar and the label
-    x_0 = axes[0].get_position().x0
-    y_0 = axes[0].get_position().y0
-    ax_group_bar1 = fig.add_axes([axes[0].get_position().x0,
-                                  axes[0].get_position().y0,
-                                  axes[0].get_position().width,
-                                  group_bar_height], frameon=False)
-    ax_group_bar2 = fig.add_axes([axes[1].get_position().x0,
-                                  axes[1].get_position().y0,
-                                  axes[1].get_position().width,
-                                  group_bar_height], frameon=False)
+    ax_group_bar1 = fig.add_axes([axes[0].get_position().x0, axes[0].get_position().y0, axes[0].get_position().width, group_bar_height], frameon=False)
+    ax_group_bar2 = fig.add_axes([axes[1].get_position().x0, axes[1].get_position().y0, axes[1].get_position().width, group_bar_height], frameon=False)
 
     # Plot the group bars
     ax_group_bar1.imshow([sorted_groups], aspect='auto', cmap='Set1')
@@ -530,15 +542,17 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
         ax_group_bar1.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
         ax_group_bar2.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
 
-    corr_coeff = _get_correlation(sorted_rfgram, sorted_reconstructed)
-    text = f'Pearson Correlation: {corr_coeff:.2f}'
-    axes[1].text(1.1, 0.5, text, fontsize=12, va='center', ha='left', transform=axes[1].transAxes)
     # Adjust layout to fit the labels
     plt.subplots_adjust(bottom=0.2)  # Increase bottom margin to accommodate labels
 
+    corr_coeff = _get_correlation(sorted_rfgram, sorted_reconstructed)
+    axes[1].text(1.1, 0.5, f'Pearson Correlation: {corr_coeff:.2f}', 
+                 fontsize=12, va='center', ha='left',
+                 transform=axes[1].transAxes)
 
     if save == True:
         plt.savefig(path, dpi=400, bbox_inches='tight')
+
 
 
 def boxplot_plotter(mags, y, indices, dic,
@@ -586,8 +600,9 @@ def boxplot_plotter(mags, y, indices, dic,
 def make_plots(adhld_results, modmags, path, s=5):
 
     # unpack reslts
-    signal, dic, rfgram, mpresults, coordinates, coefs, \
-        importances, R, diagonal, new_impo, X, Y, dic = adhld_results
+    signal, dictionary, rfgram, mpresults, coordinates, \
+        coefs, importances, R, new_diag, new_impo, X, Y, dic, \
+            subsamples, sub_mags, Y_sub = adhld_results
     
     # define paths to save all 4 plots
     path1 = os.path.join(path, 'rfgram.svg')
@@ -596,18 +611,18 @@ def make_plots(adhld_results, modmags, path, s=5):
     path4 = os.path.join(path, 'biplotn.svg')
     
     # RF GRAM MATRIX
-    rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
+    rfgram_plot(rfgram, coordinates, sub_mags, s, coefs, Y, dic, subsamples, 
                 save=True, path=path1)
 
     # BOXPLOTS OF NODES
-    boxplot_plotter(modmags, Y.values, coordinates[0:s], dic,
+    boxplot_plotter(sub_mags, Y_sub, coordinates[0:s], dic,
                     dic.keys(), save=True, path=path2)
 
     # BIPLOT
-    new_biplot3d(s, coefs, coordinates, modmags, Y, \
+    new_biplot3d(s, coefs, coordinates, sub_mags, Y_sub, \
                 'classification', dic, k=3, n=3, \
                 save=True, path=path3)
 
-    new_biplot3dnormalized(s, coefs, coordinates, modmags, Y, \
+    new_biplot3dnormalized(s, coefs, coordinates, sub_mags, Y_sub, \
                         'classification', dic, k=3, n=3,
                         save=True, path=path4)
