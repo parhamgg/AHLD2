@@ -139,6 +139,8 @@ def get_subsamples(nsubsamples, Y):
 
     size = nsubsamples / len(Y)
     x = np.arange(len(Y))
+    if nsubsamples == len(Y):
+        return x
     _, test_indices = train_test_split(x, test_size=size, stratify=Y,
                                        random_state=1)
     return test_indices
