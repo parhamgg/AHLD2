@@ -19,12 +19,10 @@ from skbio.stats.distance import DistanceMatrix
 from skbio.stats.ordination import OrdinationResults
 from skbio.stats.ordination import pcoa
 
-from scipy.sparse import csr_matrix, csc_matrix, lil_matrix
-from scipy.spatial import distance
+from scipy.sparse import csr_matrix, lil_matrix
 
 
 import q2templates
-from qiime2 import CategoricalMetadataColumn as Column
 from qiime2 import Metadata
 
 from pkg_resources import resource_filename
@@ -118,6 +116,9 @@ def get_lstar(child, tip_inds, nontip_inds, lilmat):
         lstar = np.zeros((ntips, 1))
     else:
         lstar = lilmat[nontip_inds].todense().T
+
+    if child.length is None:
+        child.length = 0
 
     lstar[tip_inds] = lstar[tip_inds] + len(tip_inds) * child.length
 
@@ -333,9 +334,6 @@ def compute_haar_dist(table, shl, diagonal):
 
     return D, modmags
 
-def make_feature_metadata(tree, taxonomy):
-    return taxonomy
-
 def haar_like_dist(table: biom.Table,
                    tree: skbio.TreeNode) \
                    -> (DistanceMatrix, skbio.TreeNode,
@@ -346,7 +344,7 @@ def haar_like_dist(table: biom.Table,
         can be thought of as a differentially encoded
         feature table. """
 
-    table, tree, ids, biomtab = match_to_tree(table, tree)
+    table, tree, _, _ = match_to_tree(table, tree)
     lilmat, shl = sparsify(tree)
     diagonal = get_lambdas(lilmat, shl)
     D, modmags = compute_haar_dist(table, shl, diagonal)
@@ -465,10 +463,20 @@ def save_species(species, output_dir):
     s = ''
     for k, v in species.items():
         s += f'\n{k}\n'
-        for x in species[k]['left']:
+
+        # Check if `species[k]` is a dictionary and contains 'left' and 'right' keys
+        left_values = species[k].get('left', []) if isinstance(species[k], dict) else []
+        right_values = species[k].get('right', []) if isinstance(species[k], dict) else []
+
+        # Add left values to the output string
+        for x in left_values:
             s += f'\t\t{x}\n'
+
+        # Add separator
         s += f'\n\t\t~~~~\n'
-        for x in species[k]['right']:
+
+        # Add right values to the output string
+        for x in right_values:
             s += f'\t\t{x}\n'
 
     fname = os.path.join(output_dir, 'species.txt')
@@ -477,36 +485,32 @@ def save_species(species, output_dir):
 
     return s
 
+
 def adaptive_visual(
         output_dir: str,
         table: biom.Table,
         tree: skbio.TreeNode,
         label: str,
         metadata: Metadata,
-        nsubsamples: int = None,
-        taxonomy: Metadata = None
+        taxonomy: Metadata = None,
+        s: int = 5,  # Number of important nodes
+        k: int = 5,  
+        n: int = 5
     ) -> None:
 
-    table, tree, ids, biomtab = match_to_tree(table, tree)
+    table, tree, _, biomtab = match_to_tree(table, tree)
     meta = _validate(metadata, label, biomtab)
-    lilmat, shl = sparsify(tree)
+    _, shl = sparsify(tree)
+    adhld_results = adaptive(shl, table, label, biomtab, meta, s)
 
-    if nsubsamples == None:
-        nsubsamples = len(meta)
+    _, _, coordinates, _, _, _, diagonal= adhld_results
 
-    adhld_results = adaptive(shl, table, label, biomtab, meta, nsubsamples, s=5)
-
-    signal, dictionary, rfgram, mpresults, coordinates, \
-        coefs, importances, R, new_diag, new_impo, X, Y, dic, \
-            subsamples, sub_mags, Y_sub = adhld_results
-
-    D, modmags = compute_haar_dist(table, shl, new_diag)
+    _, modmags = compute_haar_dist(table, shl, diagonal)
     modmags = modmags.T
 
-    make_plots(adhld_results, sub_mags, output_dir)
+    make_plots(adhld_results, modmags, output_dir, s, k, n)
 
-    # GET CONTEXT TO SEND TO HTML FILE
-
+    # Get context to send to HTML file
     if taxonomy:
         annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
         species = get_species(annotated_tree, coordinates, taxonomy)
@@ -520,7 +524,7 @@ def adaptive_visual(
                's': s
     }
 
-    # VISUALIZER
+    # Visualizer
     TEMPLATES = resource_filename(
         'q2_haarlikedist', 'adhld_assets')
     index = os.path.join(TEMPLATES, 'index.html')
@@ -541,12 +545,11 @@ def adaptive_distance(
 
     table, tree, ids, biomtab = match_to_tree(table, tree)
     meta = _validate(metadata, label, biomtab)
-    lilmat, shl = sparsify(tree)
+    _, shl = sparsify(tree)
     adhld_results = adaptive(shl, table, label,
                              biomtab, meta, s=5)
 
-    signal, dictionary, rfrgam, mpresults, coordinates, \
-        coefs, importances, R, diagonal, new_impo, X, Y, dic = adhld_results
+    _, _, _, _, _, _, diagonal = adhld_results
 
     D, modmags = compute_haar_dist(table, shl, diagonal)
 
@@ -554,6 +557,6 @@ def adaptive_distance(
     mm = csr_matrix(modmags)  # Going to see if this works w new format
     p = pcoa(D)
 
-    feature_metadata = make_feature_metadata(tree, taxonomy)
+    feature_metadata = taxonomy
     feature_metadata = feature_metadata.to_dataframe()
     return D, tree, mm, p, feature_metadata

@@ -97,7 +97,9 @@ plugin.visualizers.register_function(
         'label': Str,
         'metadata': Metadata,
         'taxonomy': Metadata,
-        'nsubsamples': Int
+        's': Int,
+        'k': Int,
+        'n': Int
     },
     input_descriptions={
         'tree': (
@@ -114,10 +116,9 @@ plugin.visualizers.register_function(
         'metadata': 'Associated metadata that is a superset of samples.',
         'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
                      'names to species names.'),
-        'nsubsamples': ('Number of subsamples to use for finding important '
-                        'internal nodes. Note that we use stratified '
-                        'subsampling so that each of the classes designated '
-                        'by LABEL will be equally represented.')
+        's': ('Number of important nodes to find'),
+        'k': ('for PCoA reconstruction'),  #TODO: update with more info
+        'n': ('for PCoA reconstruction'),  #TODO: update with more info
     },
     name='adaptive-visual',
     description='Computes haar-like-distance between samples using new' \

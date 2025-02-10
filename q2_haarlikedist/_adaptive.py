@@ -34,12 +34,12 @@ __all__ = [
     'make_plots',
     'boxplot_plotter'
 ]
-# ADAPTIVE FNS
+# ADAPTIVE FNS -> What is this comment?
 
 def preprocess(label, biomtab, shl, meta):
-    """ For adaptive hld. Converts to necesseary types for 
+    """ For adaptive hld. Converts to necessary types for
         Evan's HLD code to work.
-    
+
         label: column name in metadata,
         biomtab: biom.Table,
         shl: result from sparsification,
@@ -47,14 +47,48 @@ def preprocess(label, biomtab, shl, meta):
         returns:  X, Y, mags, dic
         """
 
-    dic = {x:i for i, x in enumerate(list(set(meta[label])), 1)}
+    # Filter metadata to exclude 'Unknown' values for the label
+    meta = meta[meta[label] != 'Unknown']
+    # Ensure the column has at least 2 different values
+    if meta[label].nunique() < 2:
+        raise ValueError(f"The column '{label}' must have at least 2 different values.")
+    # Keep equal number of samples for different values of label
+    # min_samples = meta[label].value_counts().min()
+    # meta = (
+    #     meta
+    #     .groupby(label, group_keys=False)[meta.columns]  # explicitly select columns here
+    #     .apply(
+    #         lambda x: (
+    #             x.drop(columns=[label])
+    #             .sample(n=min_samples, random_state=42)
+    #             .assign(**{label: x[label].iloc[0]})
+    #         )
+    #     )
+    # )
+
+    # Filter biomtab and meta to have same set of samples
+    sample_ids_meta = meta.index
+    sample_ids_biom = set(biomtab.ids(axis='sample'))
+    common_samples = sample_ids_meta.intersection(sample_ids_biom)
+    meta = meta.loc[common_samples]
+    biomtab.filter(common_samples, axis='sample', inplace=True)
+
+    # Create mapping dictionary for the label
+    dic = {x: i for i, x in enumerate(list(set(meta[label])), 1)}
     data = [dic[x] for x in meta[label]]
+
+    # Create Y
     Y = pd.Series(name='label', index=meta.index, data=data)
+
+    # Create X
     X = biomtab.to_dataframe().T
     table = csr_matrix(biomtab.matrix_data)
-    mags = shl@table 
+
+    mags = shl @ table
     X = X.div(X.sum(axis=1), axis=0) # I don't think this is necessary
+    # Convert X to numpy array
     X = np.array(X)
+
     return X, Y, mags, dic
 
 
@@ -109,37 +143,34 @@ def get_subsamples(nsubsamples, Y):
                                        random_state=1)
     return test_indices
 
-def convert_least_squares(affinity, mags, nsubsamples, Y, dic):
-    """ returns:
-        signal : a n_otus x n_samples**2 vector of all the sample mapping to the forest
-        A : a csc_matrix which is something??? 
+
+def convert_least_squares(affinity, mags):
+
+    """ Parameters:
+        affinity: rf affinity matrix
+        mags: same mags from before
+        
+        Returns:
+        signal: a n_otus x n_samples**2 
+                 vector of all the sample mapping to the forest
+        A: a csc_matrix which is something??? 
         sparsegram : transformed signals? some sort of mapping
+    """
 
-        input:
-        affinity : rf affinity matrix
-        mags : same mags from before
-        mags, not sure, this didn't really change """
-
-    embedding = MDS(n_components=50,dissimilarity='precomputed')
+    embedding = MDS(n_components=50,dissimilarity='precomputed', n_jobs=-1)
     nsamples = mags.shape[1]
 
-    subsamples = get_subsamples(nsubsamples, Y)
-    affinity = affinity[np.ix_(subsamples, subsamples)]
-    Y_sub = [Y[i] for i in range(len(Y)) if i in subsamples]
-    print('Y-sub ', Y_sub)
-
     # not storing 1-affinity as a matrix for size reasons 
-    X_transformed = csr_matrix(embedding.fit_transform(1 - affinity))
-    sparsegram = X_transformed@X_transformed.T
-    print(sparsegram.shape)
+    X_transformed = csr_matrix(embedding.fit_transform(1-affinity))
+    sparsegram = X_transformed @ X_transformed.T
+
     signal = csr_matrix.reshape(sparsegram,
-                                ((nsubsamples**2,1)),
+                                ((nsamples**2,1)),
                                 order='F')
-    sub_mags = mags[:,subsamples]
-    C = spouter(sub_mags, sub_mags)
+    C = spouter(mags, mags)
     A = csc_matrix(C.T)
 
-    return signal, A, sparsegram, subsamples, sub_mags, Y_sub
+    return signal, A, sparsegram
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -147,7 +178,6 @@ def matching_pursuit(signal, dictionary, s):
     dictionarynorm = normalize(dictionary, norm='l2', axis=0)
     coefs = []
     indices = []
-    importances = []
     R = signal
     
     for i in range(s):
@@ -158,45 +188,39 @@ def matching_pursuit(signal, dictionary, s):
         indices.append(index)
 
         maxproj = innerprod[index].todense().item()
-        importances.append(maxproj)
 
         coefs.append(maxproj/linalg.norm(dictionary[:,index]))
         R = R - maxproj*dictionarynorm[:,index]
 
-    return indices, coefs, importances, R
+    return indices, coefs
 
 
-def diag_impo(mags, coordinates, importances, coefficients):
+def diag_impo(mags, coordinates, coefficients):
     """ Reconstruct the diagonal arrray
         from the adaptive haarlike model.
          
         Parameters:
         mags
         coordinates
-        importances
         coefficients
 
         Returns:
-        coefs:
-        impos:
+        coefs
     """
     
     assigned = []
     coefs = np.zeros(mags.shape[0])
-    impos = np.zeros(mags.shape[0])
 
     for i in range(len(coordinates)):
 
         coord = coordinates[i]
-        impo = importances[i]
         coef = coefficients[i]
 
         if not coord in assigned:
 
             coefs[coord] = coef
-            impos[coord] = impo
 
-    return coefs, impos
+    return coefs
 
 
 def _dimensions(shl, table):
@@ -225,22 +249,18 @@ def _validate(metadata, label, biomtab):  # metadata is of type Metadata
     return meta
 
 
-def adaptive(shl, table, label, biom_table, meta, nsubsamples, s=5):
+def adaptive(shl, table, label, biom_table, meta, s):
     """ shl
         table: biom_table's data, 
         label: str, column in meta to use 
         biom_table: biom.Table
         meta: pd.dataframe
-        nsubsamples: number of subsamples for large datasets
-        s=5
+        s=5: Number of important nodes to find
 
-        returns signal, dictionary, rfrgam, mpresults, coordinates,
-        coefs, importances, R, new_diag, new_impo, X, Y, dic
+        returns dic, rfgram, coordinates, coefs, Y, dic, new_diag
     """
 
     _dimensions(shl, table)
-
-    mags = shl@table
 
     X, Y, mags, dic = preprocess(label, biom_table, shl, meta)
     clf = RandomForestClassifier(n_estimators=500,
@@ -248,29 +268,22 @@ def adaptive(shl, table, label, biom_table, meta, nsubsamples, s=5):
                                  min_samples_leaf=1)
     clf.fit(X, Y)
 
-    # s = 4 # number of important nodes to find
     rfaffinity = proximity_matrix(clf, X)
 
-    signal, dictionary, rfgram, subsamples, sub_mags, Y_sub = \
-        convert_least_squares(rfaffinity, mags, nsubsamples, Y, dic)
-    
+    signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
     signal = csc_matrix(signal)
 
-    mpresults = matching_pursuit(signal, dictionary, s)
-    coordinates, coefs, importances, R = mpresults
-    new_diag, new_impo = diag_impo(mags, coordinates, importances, coefs)
+    coordinates, coefs  = matching_pursuit(signal, dictionary, s)
+    new_diag = diag_impo(mags, coordinates, coefs)
 
-    return signal, dictionary, rfgram, mpresults, coordinates, \
-        coefs, importances, R, new_diag, new_impo, X, Y, dic, subsamples, sub_mags, Y_sub
+    return dic, rfgram, coordinates, coefs, Y, dic, new_diag
 
-# RECONSTRUCTING
 
 def reconstruct_coord(coefs, coordinates, mags, s):
     """ This function is for reconstructing and obtaining a vector
         used in plotting the biplots. The resulting coord is of shape
         n_internal_nodes_found (default 5) x n_samples (?) """
     
-    d, n = mags.get_shape()
     print("Reconstructing")
     coord = np.sqrt(coefs[0]) * mags[coordinates[0],:].todense()
     for i in range(1,s):
@@ -293,11 +306,8 @@ def reconstruct(coordinates, mags, s, coefs):
         outer: numpy.matrix of shape s x n_samples
     """
     d, n = mags.get_shape() # d=n internal nodes; n=n samples
-    print(d, n)
     outer = np.zeros((n,n))
-    print("Reconstructing")
     for i in range(s):
-        print(i)
         temp = mags[coordinates[i],:].todense()
         out = np.outer(temp, temp)
         outer = outer + coefs[i]*out
@@ -470,7 +480,7 @@ def _get_correlation(sorted_rfgram, sorted_reconstructed):
     corr = np.corrcoef(matrix1.flatten(), matrix2.flatten())[0, 1]
     return corr
 
-def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic, subsamples,
+def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save, path):
     """ rfgram is the representation of the dataset using a trained rf 
         model, which works by training an RF on all data poins then forming
@@ -483,8 +493,7 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic, subsamples,
         original random forest in a far smaller feature space."""
 
     print('here')
-    groups = list(Y) #np.array([1, 2, 1, 3, 2, 1, 3, 2, 1, 3])  # Example group labels
-    groups = np.array(list(Y))[subsamples]
+    groups = list(Y)
     inv_dic = {v:k for k, v in dic.items()}
 
     reconstructed = reconstruct(coordinates, modmags, s, coefs)
@@ -597,12 +606,10 @@ def boxplot_plotter(mags, y, indices, dic,
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
-def make_plots(adhld_results, modmags, path, s=5):
+def make_plots(adhld_results, modmags, path, s, k, n):
 
     # unpack reslts
-    signal, dictionary, rfgram, mpresults, coordinates, \
-        coefs, importances, R, new_diag, new_impo, X, Y, dic, \
-            subsamples, sub_mags, Y_sub = adhld_results
+    dic, rfgram, coordinates, coefs, Y, dic, _= adhld_results
     
     # define paths to save all 4 plots
     path1 = os.path.join(path, 'rfgram.svg')
@@ -611,18 +618,18 @@ def make_plots(adhld_results, modmags, path, s=5):
     path4 = os.path.join(path, 'biplotn.svg')
     
     # RF GRAM MATRIX
-    rfgram_plot(rfgram, coordinates, sub_mags, s, coefs, Y, dic, subsamples, 
+    rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save=True, path=path1)
 
     # BOXPLOTS OF NODES
-    boxplot_plotter(sub_mags, Y_sub, coordinates[0:s], dic,
+    boxplot_plotter(modmags, Y.values, coordinates[0:s], dic,
                     dic.keys(), save=True, path=path2)
 
     # BIPLOT
-    new_biplot3d(s, coefs, coordinates, sub_mags, Y_sub, \
-                'classification', dic, k=3, n=3, \
+    new_biplot3d(s, coefs, coordinates, modmags, Y, \
+                'classification', dic, k, n, \
                 save=True, path=path3)
 
-    new_biplot3dnormalized(s, coefs, coordinates, sub_mags, Y_sub, \
-                        'classification', dic, k=3, n=3,
+    new_biplot3dnormalized(s, coefs, coordinates, modmags, Y, \
+                        'classification', dic, k, n,
                         save=True, path=path4)
