@@ -1,6 +1,6 @@
 import numpy as np
 import os
-import pandas as pd
+import time
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -12,18 +12,18 @@ from sklearn.manifold import MDS
 from sklearn.preprocessing import normalize, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+
+import lightgbm as lgb
 
 __all__ = [
+    'calc_haar_mags',
+    'get_otu_abundances',
     'preprocess',
     'proximity_matrix',
     'spouter',
-    'get_subsamples',
     'convert_least_squares',
     'matching_pursuit',
     'diag_impo',
-    '_dimensions',
-    '_validate',
     'adaptive',
     'reconstruct_coord',
     'reconstruct',
@@ -36,7 +36,31 @@ __all__ = [
 ]
 # ADAPTIVE FNS -> What is this comment?
 
-def preprocess(label, biomtab, shl, meta):
+
+def calc_haar_mags(haar_basis, abund_vec):
+    # Convert to sparse form
+    abund_vec = csr_matrix(abund_vec)
+    # Normalize abundances
+    abund_vec = abund_vec / abund_vec.sum(axis=0)
+    # Apply Haar transformation
+    mags = haar_basis @ abund_vec
+    mags = csr_matrix(mags)
+    return mags
+
+
+def get_otu_abundances(table, tree):
+    """ Maps the given OTU abundances onto a reference tree.
+        table: pd.DataFrame
+        tree: skbio.TreeNode (Newick tree structure)
+
+        Returns:
+        - abundvec: np.ndarray (OTU abundances mapped onto the tree)
+    """
+
+    return table.reindex(columns=[leaf.name for leaf in tree.tips()], fill_value=0).T.values
+
+
+def preprocess(label, biom_table, haar_basis, metadata, tree):
     """ For adaptive hld. Converts to necessary types for
         Evan's HLD code to work.
 
@@ -47,61 +71,71 @@ def preprocess(label, biomtab, shl, meta):
         returns:  X, Y, mags, dic
         """
 
-    # Filter metadata to exclude 'Unknown' values for the label
-    meta = meta[meta[label] != 'Unknown']
-    # Ensure the column has at least 2 different values
-    if meta[label].nunique() < 2:
-        raise ValueError(f"The column '{label}' must have at least 2 different values.")
-    # Keep equal number of samples for different values of label
-    # min_samples = meta[label].value_counts().min()
-    # meta = (
-    #     meta
-    #     .groupby(label, group_keys=False)[meta.columns]  # explicitly select columns here
-    #     .apply(
-    #         lambda x: (
-    #             x.drop(columns=[label])
-    #             .sample(n=min_samples, random_state=42)
-    #             .assign(**{label: x[label].iloc[0]})
-    #         )
-    #     )
-    # )
+    labels = list(metadata[label].unique())
+    dic = dict(zip(labels, list(range(1, len(labels)+1))))
 
-    # Filter biomtab and meta to have same set of samples
-    sample_ids_meta = meta.index
-    sample_ids_biom = set(biomtab.ids(axis='sample'))
-    common_samples = sample_ids_meta.intersection(sample_ids_biom)
-    meta = meta.loc[common_samples]
-    biomtab.filter(common_samples, axis='sample', inplace=True)
+    mapped_labels = metadata[label].map(dic).rename("labels")
+    X = biom_table.to_dataframe().T.join(
+        mapped_labels, how="inner").sort_values("labels")
+    Y = X["labels"]
+    X = X.drop(columns="labels")
 
-    # Create mapping dictionary for the label
-    dic = {x: i for i, x in enumerate(list(set(meta[label])), 1)}
-    data = [dic[x] for x in meta[label]]
+    abundance_vector = get_otu_abundances(X, tree)
+    mags = calc_haar_mags(haar_basis, abundance_vector)
 
-    # Create Y
-    Y = pd.Series(name='label', index=meta.index, data=data)
+    # Save outputs for comparison
+    print("X shape:", X.shape)
+    print(type(X))
+    print(X)
+    # row_sum = X.to_numpy().sum(axis=1)
+    # print("\nRow sums (sum along axis=1):")
+    # print(row_sum)
+    # print("\nCheck for NaN or infinite values in row sums:")
+    # print(np.count_nonzero(~np.isnan(row_sum)))  # Count NaN values
+    # print((row_sum == float('inf')).sum())  # Count infinite values
+    print("Y shape:", Y.shape)
+    print(type(Y))
+    print("abundance_vector shape:", abundance_vector.shape)
+    print("mags shape:", mags.shape)
+    print("haar_basis shape:", haar_basis.shape)
+    # import json
+    # import scipy.sparse as sp
+    # X.to_csv("X_check.csv")
+    # Y.to_csv("Y_check.csv")
+    # np.save('abundance_vector_check.npy', abundance_vector)
+    # sp.save_npz("mags_check.npz", mags)
+    # sp.save_npz('shl_check.npz', csr_matrix(haar_basis))
+    # with open("dic_check.txt", "w") as f:
+    #     json.dump(dic, f)
 
-    # Create X
-    X = biomtab.to_dataframe().T
-    table = csr_matrix(biomtab.matrix_data)
-
-    mags = shl @ table
-    X = X.div(X.sum(axis=1), axis=0) # I don't think this is necessary
-    # Convert X to numpy array
+    # Normalize X
+    sums = X.to_numpy().sum(axis=1)
+    X = X.div(sums, axis=0)
     X = np.array(X)
 
     return X, Y, mags, dic
 
 
-def proximity_matrix(clf, X):     
+def proximity_matrix(clf, X, lgbm):
     """ Generate random forest affinity matrix
     clf: a classifier (RandomForestClassifier)
-    X : data matrix with dimensions n by m """
-    
-    # terminals = index of the leaf in each decision tree that a sample 
-    # (or samples) would land in. (nsamples x n estimators)
+    X : data matrix with dimensions n by m 
+    lgbm: Model to use (true=LGBM/False)
+    """
 
-    terminals = clf.apply(X)
+    # terminals = index of the leaf in each decision tree that a sample
+    # (or samples) would land in. (nsamples x n estimators)
+    print('proximity matrix')
+    if lgbm:
+        terminals = clf.predict(X, pred_leaf=True, n_jobs=6)
+    else:
+        terminals = clf.apply(X)
+
+    print('tree leaves preds. shape', terminals.shape)
+
     nsamples, nTrees = terminals.shape
+
+    # 1 - orig
     prox = np.zeros((nsamples, nsamples))
 
     for i in range(nTrees):
@@ -109,20 +143,66 @@ def proximity_matrix(clf, X):
         prox += 1*np.equal.outer(a, a)
 
     prox = prox / nTrees
+    print(prox)
+    print(prox.shape)
 
-    return prox 
+
+
+    # 2
+    # prox = np.sum(np.equal.outer(terminals, terminals), axis=2) / nTrees
+
+
+    # 3
+    # from joblib import Parallel, delayed
+    # def compute_prox(i):
+    #     """Computes contribution of tree i to proximity matrix."""
+    #     a = terminals[:, i]
+    #     return np.equal.outer(a, a).astype(int)
+    # # Run in parallel across multiple threads
+    # prox = sum(Parallel(n_jobs=-1)(delayed(compute_prox)(i) for i in range(nTrees))) / nTrees
+    # print(prox)
+    # print()
+
+    # # 4
+    # from joblib import Parallel, delayed
+    # def compute_sparse_row(i, terminals):
+    #     """Computes a single row of the sparse dissimilarity matrix."""
+    #     diff = np.sum(terminals[i] == terminals, axis=1) / terminals.shape[1]
+    #     return diff  # Return only the computed row
+    # # Get total number of samples
+    # n_samples = terminals.shape[0]
+    # # Compute dissimilarity matrix in parallel (row-wise)
+    # results = Parallel(n_jobs=-1)(
+    #     delayed(compute_sparse_row)(i, terminals) for i in range(n_samples)
+    # )
+
+    # print(np.array(np.vstack(results)))
+    # print()
+    # # Convert results into a sparse CSR matrix
+    # sparse_dissimilarity = csr_matrix(np.vstack(results))
+
+    # from sklearn.decomposition import TruncatedSVD
+
+    # # Suppose X is large and sparse (e.g., shape [n_samples, n_features])
+    # svd = TruncatedSVD(n_components=600, random_state=42)
+
+    # sparse_dissimilarity_reduced = svd.fit_transform(sparse_dissimilarity)
+
+    # print(sparse_dissimilarity_reduced.shape)
+    # return sparse_dissimilarity_reduced
+    return prox
 
 
 def spouter(A, B):
     """ Quickly compute sparse outer product
     of two matrices. 
-    
+
     SOURCE:   https://stackoverflow.com/
         questions/57099722/row-wise-outer-product-on-sparse-matrices """
 
     N, L = A.shape
     N, K = B.shape
-    
+
     drows = zip(*(np.split(x.data, x.indptr[1:-1]) for x in (A, B)))
     data = [np.outer(a, b).ravel() for a, b in drows]
     irows = zip(*(np.split(x.indices, x.indptr[1:-1]) for x in (A, B)))
@@ -131,48 +211,47 @@ def spouter(A, B):
         for a, b in irows
     ]
     indptr = np.fromiter(chain((0, ), map(len, indices)), int).cumsum()
-    
+
     return csr_matrix((np.concatenate(data), np.concatenate(indices), indptr),
                       (N, L * K))
 
-def get_subsamples(nsubsamples, Y):
 
-    size = nsubsamples / len(Y)
-    x = np.arange(len(Y))
-    if nsubsamples == len(Y):
-        return x
-    _, test_indices = train_test_split(x, test_size=size, stratify=Y,
-                                       random_state=1)
-    return test_indices
-
-
-def convert_least_squares(affinity, mags):
-
+def convert_least_squares(affinity, mags, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
         mags: same mags from before
-        
+
         Returns:
         signal: a n_otus x n_samples**2 
                  vector of all the sample mapping to the forest
         A: a csc_matrix which is something??? 
         sparsegram : transformed signals? some sort of mapping
     """
+    print('convert least squares')
+    embedding = MDS(n_components=size_embedding,
+                    dissimilarity='precomputed', n_jobs=-1)
+    # embedding = MDS(n_components=size_embedding, dissimilarity='euclidean', n_jobs=-1)
+    affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
+    print(affinity_transformed.shape)
+    print(affinity_transformed)
 
-    embedding = MDS(n_components=50,dissimilarity='precomputed', n_jobs=-1)
+
+    # from umap import UMAP
+    # umap_model = UMAP(n_components=size_embedding)
+    # affinity_transformed = csr_matrix(umap_model.fit_transform(affinity))
+
+
+    sparsegram = affinity_transformed @ affinity_transformed.T
+    print(sparsegram.shape)
+
     nsamples = mags.shape[1]
-
-    # not storing 1-affinity as a matrix for size reasons 
-    X_transformed = csr_matrix(embedding.fit_transform(1-affinity))
-    sparsegram = X_transformed @ X_transformed.T
-
     signal = csr_matrix.reshape(sparsegram,
-                                ((nsamples**2,1)),
+                                ((nsamples**2, 1)),
                                 order='F')
-    C = spouter(mags, mags)
-    A = csc_matrix(C.T)
+    basis_dictionary = spouter(mags, mags).T
+    basis_dictionary_sparse = csc_matrix(basis_dictionary)
 
-    return signal, A, sparsegram
+    return signal, basis_dictionary_sparse, sparsegram
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -181,9 +260,8 @@ def matching_pursuit(signal, dictionary, s):
     coefs = []
     indices = []
     R = signal
-    
+
     for i in range(s):
-        print(i)
         innerprod = dictionarynorm.T@R
 
         index = np.argmax((innerprod))
@@ -191,8 +269,8 @@ def matching_pursuit(signal, dictionary, s):
 
         maxproj = innerprod[index].todense().item()
 
-        coefs.append(maxproj/linalg.norm(dictionary[:,index]))
-        R = R - maxproj*dictionarynorm[:,index]
+        coefs.append(maxproj/linalg.norm(dictionary[:, index]))
+        R = R - maxproj*dictionarynorm[:, index]
 
     return indices, coefs
 
@@ -200,7 +278,7 @@ def matching_pursuit(signal, dictionary, s):
 def diag_impo(mags, coordinates, coefficients):
     """ Reconstruct the diagonal arrray
         from the adaptive haarlike model.
-         
+
         Parameters:
         mags
         coordinates
@@ -209,7 +287,7 @@ def diag_impo(mags, coordinates, coefficients):
         Returns:
         coefs
     """
-    
+
     assigned = []
     coefs = np.zeros(mags.shape[0])
 
@@ -225,71 +303,104 @@ def diag_impo(mags, coordinates, coefficients):
     return coefs
 
 
-def _dimensions(shl, table):
-    
-    if shl.shape[0] != table.shape[0]:
-        m = f'shl ({shl.shape}) and table ({table.shape})' \
-            f'shape mismatch in adaptive'
-        raise ValueError(m)
+def train_LGBM(X, Y):
+    # Convert Y to 1D if it's a single column DataFrame
+    Y_1d = Y.squeeze()
+    unique_labels = sorted(Y_1d.unique())
+    num_unique = len(unique_labels)
+
+    # Shift labels so smallest is 0 (LightGBM multiclass requires 0-based)
+    shift = unique_labels[0]
+    Y_1d_zero_based = Y_1d - shift
+
+    # Choose objective
+    if num_unique == 2:
+        objective = 'binary'
+        metric = 'binary_logloss'
+    else:
+        objective = 'multiclass'
+        metric = 'multi_logloss'
+
+    # Prepare LightGBM Datasets
+    train_data = lgb.Dataset(X, label=Y_1d_zero_based)
+
+    # LightGBM parameters for a FAST model
+    params = {
+        'objective': objective,
+        'metric': metric,
+        'num_class': num_unique,
+        'learning_rate': 0.16819239188201524,
+        'num_leaves': 6,
+        'max_depth': 38,
+        'min_data_in_leaf': 1,  # equivalent to min_samples_leaf
+        'bagging_fraction': 0.8945334948696256,
+        'bagging_freq': 1,
+        'feature_fraction': 0.7271535699005337,
+        'verbose': -1
+    }
+
+    num_boost_round = 247
+
+    start_lgb = time.time()
+    bst = lgb.train(
+        params=params,
+        train_set=train_data,
+        num_boost_round=num_boost_round,
+    )
+    end_lgb = time.time()
+    lgb_time = end_lgb - start_lgb
+    print(f"LightGBM training time: {lgb_time:.2f} s")
+
+    return bst
 
 
-def _validate(metadata, label, biomtab):  # metadata is of type Metadata
-
-    meta = metadata.to_dataframe()
-
-    if label not in metadata.columns:
-        m = f'Label column id: {label} not found in metadata columns.'
-        raise ValueError(m)
-
-    ids = list(biomtab.ids(axis='sample'))
-    if not all(z in meta.index for z in ids):
-        m = 'Table indeces are not a subset of metadata.'
-        raise KeyError(m)
-
-    meta = meta.loc[ids]
-
-    return meta
-
-
-def adaptive(shl, table, label, biom_table, meta, s):
-    """ shl
-        table: biom_table's data, 
+def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm=False):
+    """ shl: sparse haar like coordinates
+        biom_table_data: biom_table, 
         label: str, column in meta to use 
-        biom_table: biom.Table
+        biom_table: skbio.TreeNode
         meta: pd.dataframe
         s=5: Number of important nodes to find
 
         returns dic, rfgram, coordinates, coefs, Y, dic, new_diag
     """
 
-    _dimensions(shl, table)
+    X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
+    print('preprocessing done.')
 
-    X, Y, mags, dic = preprocess(label, biom_table, shl, meta)
-    clf = RandomForestClassifier(n_estimators=500,
-                                 bootstrap=True,
-                                 min_samples_leaf=1)
-    clf.fit(X, Y)
+    # DEBUG
+    if lgbm:
+        clf = train_LGBM(X, Y)
+    else:
+        clf = RandomForestClassifier(n_estimators=500,
+                                     bootstrap=True,
+                                     min_samples_leaf=1,
+                                     n_jobs=-1)
+        clf.fit(X, Y)
+    print('training done.')
 
-    rfaffinity = proximity_matrix(clf, X)
+    rfaffinity = proximity_matrix(clf, X, lgbm)
+    print('affinity generated.')
 
     signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
     signal = csc_matrix(signal)
+    print('signal created.')
 
-    coordinates, coefs  = matching_pursuit(signal, dictionary, s)
+    coordinates, coefs = matching_pursuit(signal, dictionary, s)
+    print('signal estimated with Haar coefs.')
     new_diag = diag_impo(mags, coordinates, coefs)
 
-    return dic, rfgram, coordinates, coefs, Y, dic, new_diag
+    return dic, rfgram, coordinates, coefs, Y, dic, new_diag, mags
 
 
 def reconstruct_coord(coefs, coordinates, mags, s):
     """ This function is for reconstructing and obtaining a vector
         used in plotting the biplots. The resulting coord is of shape
         n_internal_nodes_found (default 5) x n_samples (?) """
-    
-    print("Reconstructing")
-    coord = np.sqrt(coefs[0]) * mags[coordinates[0],:].todense()
-    for i in range(1,s):
-        nodei = np.sqrt(coefs[i]) * mags[coordinates[i],:].todense()
+
+    coord = np.sqrt(coefs[0]) * mags[coordinates[0], :].todense()
+    for i in range(1, s):
+        nodei = np.sqrt(coefs[i]) * mags[coordinates[i], :].todense()
         coord = np.vstack((coord, nodei))
     return coord
 
@@ -307,10 +418,10 @@ def reconstruct(coordinates, mags, s, coefs):
         returns 
         outer: numpy.matrix of shape s x n_samples
     """
-    d, n = mags.get_shape() # d=n internal nodes; n=n samples
-    outer = np.zeros((n,n))
+    d, n = mags.get_shape()  # d=n internal nodes; n=n samples
+    outer = np.zeros((n, n))
     for i in range(s):
-        temp = mags[coordinates[i],:].todense()
+        temp = mags[coordinates[i], :].todense()
         out = np.outer(temp, temp)
         outer = outer + coefs[i]*out
     return outer
@@ -318,15 +429,13 @@ def reconstruct(coordinates, mags, s, coefs):
 
 # PLOTTERS
 
-def new_biplot3d(s, coefs, coordinates, mags, y, \
-                 labeltype,dic,k,n,save,path):
-    
-    print('starting new biplot')
-    Z=np.transpose(reconstruct_coord(coefs, coordinates, mags, s))
-    print('finished the transpose')
+def new_biplot3d(s, coefs, coordinates, mags, y,
+                 labeltype, dic, k, n, save, path):
+
+    Z = np.transpose(reconstruct_coord(coefs, coordinates, mags, s))
     pca = PCA()
     x_new = pca.fit_transform(np.asarray(Z))
-    score = x_new[:,0:3]
+    score = x_new[:, 0:3]
     coeff = np.transpose(pca.components_[0:3, :])
     xs = score[:, 0]
     ys = score[:, 1]
@@ -348,27 +457,28 @@ def new_biplot3d(s, coefs, coordinates, mags, y, \
         else:
             colors = cm.tab10(y/max(y))
 
-        for xs , ys, zs, c, label in zip(xs, ys, zs, colors, labels):
+        for xs, ys, zs, c, label in zip(xs, ys, zs, colors, labels):
             ax.scatter(xs*scalex, ys*scaley, zs*scalez,
-                        facecolors="None", edgecolors=c,label=label)
+                       facecolors="None", edgecolors=c, label=label)
 
         handles, labels = plt.gca().get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         plt.legend(by_label.values(), by_label.keys(), prop={'size': 7})
 
-    elif labeltype == 'regression': 
+    elif labeltype == 'regression':
         c = cm.viridis(y/max(y))
-        p = ax.scatter(xs*scalex ,ys*scaley, zs*scalez,c=y, cmap='viridis')
-        plt.colorbar(p, pad = 0.15)
-        
+        p = ax.scatter(xs*scalex, ys*scaley, zs*scalez, c=y, cmap='viridis')
+        plt.colorbar(p, pad=0.15)
+
     for i in range(n):
         ax.quiver(
-            0, 0, 0, # starting point of vector
-            1.15*coeff[i,0], 1.15*coeff[i,1], 1.15*coeff[i,2], # vector directi
-            color = 'black', alpha = .7, lw = 2
+            0, 0, 0,  # starting point of vector
+            1.15*coeff[i, 0], 1.15*coeff[i, 1], 1.15 *
+            coeff[i, 2],  # vector directi
+            color='black', alpha=.7, lw=2
         )
         ax.text(
-            coeff[i,0]* 1.25, coeff[i,1] * 1.25, coeff[i,2] * 1.25,
+            coeff[i, 0] * 1.25, coeff[i, 1] * 1.25, coeff[i, 2] * 1.25,
             coordinates[i],
             color='black', ha='center', va='center'
         )
@@ -384,35 +494,34 @@ def new_biplot3d(s, coefs, coordinates, mags, y, \
     ax.set_zlabel(zlab)
     box = ax.get_position()
     ax.set_position([box.x0, box.y0, box.width * 6, box.height])
-    
+
     plt.title('PCA Biplot')
     ax.grid(False)
     ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.set_facecolor('white')
-    ax.dist=12
+    ax.dist = 12
     fig.tight_layout(pad=2)
 
     if save == True:
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
-def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
+def new_biplot3dnormalized(s, coefs, coordinates, mags, y,
                            labeltype, dic, k, n, save, path):
-    print('in making new biplot')
+
     Z = np.transpose(reconstruct_coord(coefs, coordinates, mags, s))
-    print('reconstructed for Z')
     scaler = StandardScaler()
     scaler.fit(np.asarray(Z))
-    Z = scaler.transform(np.asarray(Z))  
+    Z = scaler.transform(np.asarray(Z))
     pca = PCA()
     x_new = pca.fit_transform(Z)
-    score = x_new[: ,0:3]
+    score = x_new[:, 0:3]
     coeff = np.transpose(pca.components_[0:3, :])
-    xs = score[:,0]
-    ys = score[:,1]
-    zs = score[:,2]
+    xs = score[:, 0]
+    ys = score[:, 1]
+    zs = score[:, 2]
     scalex = 1.0 / (xs.max() - xs.min())
     scaley = 1.0 / (ys.max() - ys.min())
     scalez = 1.0 / (zs.max() - ys.min())
@@ -421,7 +530,7 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
 
     if not dic is None:
         inv_map = {v: k for k, v in dic.items()}
-        labels=[inv_map[i] for i in y]
+        labels = [inv_map[i] for i in y]
     if labeltype == 'classification':
         if len(y) == 2:
             colors = cm.tab10(y / (2*max(y)))
@@ -439,20 +548,20 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
 
     elif labeltype == 'regression':
         c = plt.cm.viridis(y / max(y))
-        p=ax.scatter(xs*scalex, ys*scaley, zs*scalez,
-                     c=y, cmap='viridis')
+        p = ax.scatter(xs*scalex, ys*scaley, zs*scalez,
+                       c=y, cmap='viridis')
         plt.colorbar(p, pad=0.15)
-    
-  
+
     for i in range(n):
         ax.quiver(
-            0, 0, 0, # starting point of vector
-            1.15*coeff[i,0], 1.15*coeff[i,1], 1.15*coeff[i,2], # vector directi
-            color = 'black', alpha = .7, lw = 2
+            0, 0, 0,  # starting point of vector
+            1.15*coeff[i, 0], 1.15*coeff[i, 1], 1.15 *
+            coeff[i, 2],  # vector directi
+            color='black', alpha=.7, lw=2
         )
-        ax.text(coeff[i,0]* 1.25, coeff[i,1] * 1.25,coeff[i,2] * 1.25,
-                coordinates[i], color = 'black', ha = 'center', va = 'center') 
-        
+        ax.text(coeff[i, 0] * 1.25, coeff[i, 1] * 1.25, coeff[i, 2] * 1.25,
+                coordinates[i], color='black', ha='center', va='center')
+
     rat0 = np.around(pca.explained_variance_ratio_[0]*100, 2)
     rat1 = np.around(pca.explained_variance_ratio_[1]*100, 2)
     rat2 = np.around(pca.explained_variance_ratio_[2]*100, 2)
@@ -468,7 +577,7 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,\
     ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
     ax.set_facecolor('white')
-    ax.dist=12
+    ax.dist = 12
     fig.tight_layout(pad=2)
 
     if save == True:
@@ -482,6 +591,7 @@ def _get_correlation(sorted_rfgram, sorted_reconstructed):
     corr = np.corrcoef(matrix1.flatten(), matrix2.flatten())[0, 1]
     return corr
 
+
 def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save, path):
     """ rfgram is the representation of the dataset using a trained rf 
@@ -494,12 +604,10 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
         that our learned weight vector w does a good job of recapitulating the
         original random forest in a far smaller feature space."""
 
-    print('here')
     groups = list(Y)
-    inv_dic = {v:k for k, v in dic.items()}
+    inv_dic = {v: k for k, v in dic.items()}
 
     reconstructed = reconstruct(coordinates, modmags, s, coefs)
-    print('here, reconstructed')
     sorted_indices = np.argsort(groups)
     sorted_groups = np.array(groups)[sorted_indices]
     group_names = [inv_dic[x] for x in sorted_groups]  # Name for each group
@@ -524,8 +632,10 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
     # Adjust the position and size to fit the bars
     group_bar_height = 0.05  # Height of the group bars
     label_padding = 0.1  # Space between the bar and the label
-    ax_group_bar1 = fig.add_axes([axes[0].get_position().x0, axes[0].get_position().y0, axes[0].get_position().width, group_bar_height], frameon=False)
-    ax_group_bar2 = fig.add_axes([axes[1].get_position().x0, axes[1].get_position().y0, axes[1].get_position().width, group_bar_height], frameon=False)
+    ax_group_bar1 = fig.add_axes([axes[0].get_position().x0, axes[0].get_position(
+    ).y0, axes[0].get_position().width, group_bar_height], frameon=False)
+    ax_group_bar2 = fig.add_axes([axes[1].get_position().x0, axes[1].get_position(
+    ).y0, axes[1].get_position().width, group_bar_height], frameon=False)
 
     # Plot the group bars
     ax_group_bar1.imshow([sorted_groups], aspect='auto', cmap='Set1')
@@ -545,19 +655,21 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
     for i, group in enumerate(unique_groups):
 
         # Center position for the group label
-        center = (start_idx[i] + end_idx[i] -1) / 2
-        print(center, start_idx[i], end_idx[i])
+        center = (start_idx[i] + end_idx[i] - 1) / 2
 
         # Adjust the vertical position of the labels to avoid overlap
         label_y = 1
-        ax_group_bar1.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
-        ax_group_bar2.text(center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
+        ax_group_bar1.text(
+            center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
+        ax_group_bar2.text(
+            center, label_y, group_names[start_idx[i]], ha='center', va='top', rotation=90, fontsize=10)
 
     # Adjust layout to fit the labels
-    plt.subplots_adjust(bottom=0.2)  # Increase bottom margin to accommodate labels
+    # Increase bottom margin to accommodate labels
+    plt.subplots_adjust(bottom=0.2)
 
     corr_coeff = _get_correlation(sorted_rfgram, sorted_reconstructed)
-    axes[1].text(1.1, 0.5, f'Pearson Correlation: {corr_coeff:.2f}', 
+    axes[1].text(1.1, 0.5, f'Pearson Correlation: {corr_coeff:.2f}',
                  fontsize=12, va='center', ha='left',
                  transform=axes[1].transAxes)
 
@@ -565,12 +677,11 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
-
 def boxplot_plotter(mags, y, indices, dic,
                     xlabels, save, path):
 
     fig, ax = plt.subplots(len(indices), sharex=True,
-                           figsize=(4, 2.5 * len(indices)))
+                           figsize=(14, 2.5 * len(indices)))
     boxlabels = list(dic.keys())
     inv_map = {v: k for k, v in dic.items()}
     datalabels = [inv_map[i] for i in y]
@@ -578,7 +689,7 @@ def boxplot_plotter(mags, y, indices, dic,
         alldata = []
         for i in range(len(boxlabels)):
             dataindices = [
-                j 
+                j
                 for j, x in enumerate(datalabels)
                 if x == boxlabels[i]]
             alldata.append(
@@ -611,14 +722,14 @@ def boxplot_plotter(mags, y, indices, dic,
 def make_plots(adhld_results, modmags, path, s, k, n):
 
     # unpack reslts
-    dic, rfgram, coordinates, coefs, Y, dic, _= adhld_results
-    
+    dic, rfgram, coordinates, coefs, Y, dic, _, _ = adhld_results
+
     # define paths to save all 4 plots
     path1 = os.path.join(path, 'rfgram.svg')
     path2 = os.path.join(path, 'boxplot.svg')
     path3 = os.path.join(path, 'biplot.svg')
     path4 = os.path.join(path, 'biplotn.svg')
-    
+
     # RF GRAM MATRIX
     rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
                 save=True, path=path1)
@@ -628,10 +739,10 @@ def make_plots(adhld_results, modmags, path, s, k, n):
                     dic.keys(), save=True, path=path2)
 
     # BIPLOT
-    new_biplot3d(s, coefs, coordinates, modmags, Y, \
-                'classification', dic, k, n, \
-                save=True, path=path3)
+    new_biplot3d(s, coefs, coordinates, modmags, Y,
+                 'classification', dic, k, n,
+                 save=True, path=path3)
 
-    new_biplot3dnormalized(s, coefs, coordinates, modmags, Y, \
-                        'classification', dic, k, n,
-                        save=True, path=path4)
+    new_biplot3dnormalized(s, coefs, coordinates, modmags, Y,
+                           'classification', dic, k, n,
+                           save=True, path=path4)

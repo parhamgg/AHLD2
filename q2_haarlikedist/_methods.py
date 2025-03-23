@@ -6,12 +6,15 @@
 # The full license is in the file LICENSE, distributed with this software.
 # ----------------------------------------------------------------------------
 
+from collections import defaultdict
 import skbio
 import qiime2
 import biom
+import scipy
 import numpy as np
 import pandas as pd
 import os
+import hashlib
 
 from skbio import read
 from skbio.tree import TreeNode
@@ -19,7 +22,7 @@ from skbio.stats.distance import DistanceMatrix
 from skbio.stats.ordination import OrdinationResults
 from skbio.stats.ordination import pcoa
 
-from scipy.sparse import csr_matrix, lil_matrix
+from scipy.sparse import csr_matrix, lil_matrix, save_npz, load_npz
 
 
 import q2templates
@@ -55,6 +58,8 @@ def initiate_values(t2):
     This is why it is computed iteratively for internal nodes
     with non-tip descendants. """
 
+    # DEBUG
+    t2.bifurcate(0)
     ntips = len([x for x in t2.tips()])
     shl = lil_matrix((ntips, ntips))
     lilmat = lil_matrix((ntips, ntips))
@@ -210,13 +215,13 @@ def create_branching_tree(t2, lilmat, shl):
     """ Returns lilmat, shl represented as two branching trees. 
         This will allow the number of internal nodes to 
         match the number of tips. 
-        
+
         NOTE: ntips0 and ntips1 are defined as 1 in the case
         that a root's child is a tip. Otherwise this would
         assign 0 causing division by 0 errors for values0,
         or values 1
         """
-    
+
     child0, child1 = t2.children
 
     ntips0 = len([x for x in child0.tips()])
@@ -252,7 +257,7 @@ def sparsify(t2):
 
     traversal = t2.non_tips(include_self=True)
     for i, node in enumerate(traversal):
-        
+
         case = get_case(node)
 
         if case == 'neither':
@@ -270,6 +275,35 @@ def sparsify(t2):
     lilmat, shl = create_branching_tree(t2, lilmat, shl)
 
     return lilmat, shl
+
+
+def fast_tree_hash(tree):
+    """Efficiently generate a unique hash for a tree structure."""
+    def hash_node(node):
+        node_id = node.name if node.name is not None else ""
+        child_hashes = tuple(sorted(hash_node(child)
+                             for child in node.children)) if node.children else ()
+        return hashlib.sha256((node_id + str(child_hashes)).encode()).hexdigest()
+
+    return hash_node(tree)
+
+
+def get_haar_basis(tree, cache_dir="cache/"):
+    """Returns cached Haar basis if available, otherwise computes and saves it."""
+
+    os.makedirs(cache_dir, exist_ok=True)  # Ensure cache directory exists
+    tree_id = fast_tree_hash(tree)  # Fast unique tree identifier
+    cache_path = os.path.join(cache_dir, f"haar_basis_{tree_id}.npz")
+    print('cache path:', os.getcwd(), cache_path)
+
+    if os.path.exists(cache_path):
+        print(f"Loading cached Haar basis for tree {tree_id}...")
+        return load_npz(cache_path).tolil()  # Load from cache
+
+    print(f"Computing Haar basis for new tree {tree_id}...")
+    _, haar_basis = sparsify(tree)
+    save_npz(cache_path, haar_basis.tocsr())
+    return haar_basis
 
 
 def get_lambda(lilmat, shl, i):
@@ -293,27 +327,24 @@ def get_lambdas(lilmat, shl):
     return diagonal
 
 
-def match_to_tree(table, tree):
+def match_to_tree(biom_table, tree):
     """ Returns aligned data in biom format.
-        table: biom.Table.
+        biom_table: biom.Table.
         tree: skbio.TreeNode. """
-    
-    table = table.norm(inplace=False)
-    biomtab, tree = table.align_tree(tree)
-    ids = biomtab.ids()
-    table = biomtab.matrix_data.tocsr()
-    tree.bifurcate(0)
 
-    return table, tree, ids, biomtab
+    biom_table = biom_table.norm(inplace=False)
+    biom_table, tree = biom_table.align_tree(tree)
+
+    return tree, biom_table
 
 
-def compute_haar_dist(table, shl, diagonal):
+def compute_haar_dist(mags, diagonal):
 
     # columns are samples
-    nsamples = table.shape[1]
+    nsamples = mags.shape[1]
     diagonal_mat = csr_matrix([diagonal] * nsamples)
     diagonal_mat_sqrt = np.sqrt(diagonal_mat)
-    mags = shl @ table
+
     modmags = mags.T.multiply(diagonal_mat_sqrt)
 
     # compute the distance matrix
@@ -329,32 +360,10 @@ def compute_haar_dist(table, shl, diagonal):
     D = D + D.T
 
     # Check if D is symmetric
-    print(D)
     assert (D != D.T).nnz == 0
 
     return D, modmags
 
-def haar_like_dist(table: biom.Table,
-                   tree: skbio.TreeNode) \
-                   -> (DistanceMatrix, skbio.TreeNode,
-                       csr_matrix, OrdinationResults): # type: ignore
-    """ Returns D, tree, mm. Distance matrix and significance.
-        Returns distance matrix and formatted tree.
-        This now returns modmags as a biom table, which
-        can be thought of as a differentially encoded
-        feature table. """
-
-    table, tree, _, _ = match_to_tree(table, tree)
-    lilmat, shl = sparsify(tree)
-    diagonal = get_lambdas(lilmat, shl)
-    D, modmags = compute_haar_dist(table, shl, diagonal)
-    D = DistanceMatrix(np.array(D.todense()))
-    mm = csr_matrix(modmags)  # Going to see if this works w new format
-    p = pcoa(D)
-
-    return D, tree, mm, p
-
-from collections import defaultdict
 
 def left_children(node):
     if not node.children[0].is_tip():
@@ -362,11 +371,13 @@ def left_children(node):
     else:
         return [node.children[0].name]
 
+
 def right_children(node):
     if not node.children[1].is_tip():
         return [x.name for x in node.children[1].tips()]
     else:
         return [node.children[1].name]
+
 
 def get_taxa(node_name_list, taxonomy, make_set=True):
     """ node_name_list, taxonomy in dict form, make_set=True """
@@ -378,9 +389,11 @@ def get_taxa(node_name_list, taxonomy, make_set=True):
             t = 'not found'
         taxa.append(t)
 
-    if make_set: taxa = set(taxa)
+    if make_set:
+        taxa = set(taxa)
 
     return taxa
+
 
 def get_important_taxa(tree, idx, taxonomy):
 
@@ -394,8 +407,8 @@ def get_important_taxa(tree, idx, taxonomy):
 
     return l_taxa, r_taxa
 
-def get_species(tree, coords, taxonomy):
 
+def get_species(tree, coords, taxonomy):
     """ Returns a dictionary of dictionaries with node,
         left, right as keys each containing list of
         tip species. Inputs: tree, coordinates. """
@@ -414,15 +427,15 @@ def get_species(tree, coords, taxonomy):
 
 def find_common_clade(node, taxonomy):
     """ Taxonomy must be a dict mapping tips to taxonomies """
-    
+
     # Get the taxonomy paths for all descendant tips
     taxonomies = [taxonomy[tip.name].split(';')
                   for tip in node.tips()
                   if tip.name in taxonomy]
-    
-    if not taxonomies: # This should only be true for the root or unfound taxa
+
+    if not taxonomies:  # This should only be true for the root or unfound taxa
         return None
-    
+
     # Find the common clade by comparing taxonomy paths
     common_clade = []
     for clade_parts in zip(*taxonomies):
@@ -430,11 +443,11 @@ def find_common_clade(node, taxonomy):
             common_clade.append(clade_parts[0])
         else:
             break
-    
+
     # Return the common clade as a semicolon-separated string
     clade = ';'.join(common_clade) if common_clade else None
 
-    return clade 
+    return clade
 
 
 def annotate_tree(tree, taxonomy):
@@ -458,6 +471,7 @@ def annotate_tree(tree, taxonomy):
 
     return tree, taxonomy_map
 
+
 def save_species(species, output_dir):
 
     s = ''
@@ -465,8 +479,10 @@ def save_species(species, output_dir):
         s += f'\n{k}\n'
 
         # Check if `species[k]` is a dictionary and contains 'left' and 'right' keys
-        left_values = species[k].get('left', []) if isinstance(species[k], dict) else []
-        right_values = species[k].get('right', []) if isinstance(species[k], dict) else []
+        left_values = species[k].get(
+            'left', []) if isinstance(species[k], dict) else []
+        right_values = species[k].get(
+            'right', []) if isinstance(species[k], dict) else []
 
         # Add left values to the output string
         for x in left_values:
@@ -486,26 +502,51 @@ def save_species(species, output_dir):
     return s
 
 
+def haar_like_dist(table: biom.Table,
+                   tree: skbio.TreeNode) \
+    -> (DistanceMatrix, skbio.TreeNode,
+        csr_matrix, OrdinationResults):  # type: ignore
+    """ Returns D, tree, mm. Distance matrix and significance.
+        Returns distance matrix and formatted tree.
+        This now returns modmags as a biom table, which
+        can be thought of as a differentially encoded
+        feature table. """
+
+    lilmat, haar_basis = sparsify(tree)
+    abund_vec = get_otu_abundances(table, tree)
+
+    diagonal = get_lambdas(lilmat, haar_basis)
+    mags = calc_haar_mags(haar_basis, abund_vec)
+
+    D, modmags = compute_haar_dist(mags, diagonal)
+    D = DistanceMatrix(np.array(D.todense()))
+    mm = csr_matrix(modmags)  # Going to see if this works w new format
+    p = pcoa(D)
+
+    return D, tree, mm, p
+
+
 def adaptive_visual(
-        output_dir: str,
-        table: biom.Table,
-        tree: skbio.TreeNode,
-        label: str,
-        metadata: Metadata,
-        taxonomy: Metadata = None,
-        s: int = 5,  # Number of important nodes
-        k: int = 5,  
-        n: int = 5
-    ) -> None:
+    output_dir: str,
+    biom_table: biom.Table,
+    tree: skbio.TreeNode,
+    label: str,
+    metadata: Metadata,
+    taxonomy: Metadata = None,
+    s: int = 5,  # Number of important nodes
+    k: int = 5,
+    n: int = 5
+) -> None:
 
-    table, tree, _, biomtab = match_to_tree(table, tree)
-    meta = _validate(metadata, label, biomtab)
-    _, shl = sparsify(tree)
-    adhld_results = adaptive(shl, table, label, biomtab, meta, s)
+    tree, biom_table = match_to_tree(biom_table, tree)
+    haar_basis = get_haar_basis(tree)
+    meta = metadata.to_dataframe()
 
-    _, _, coordinates, _, _, _, diagonal= adhld_results
+    adhld_results = adaptive(haar_basis, biom_table, label, tree, meta, s)
 
-    _, modmags = compute_haar_dist(table, shl, diagonal)
+    _, _, coordinates, _, _, _, diagonal, mags = adhld_results
+
+    _, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
 
     make_plots(adhld_results, modmags, output_dir, s, k, n)
@@ -515,14 +556,14 @@ def adaptive_visual(
         annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
         species = get_species(annotated_tree, coordinates, taxonomy)
     else:
-        species = {'coord 1':'No taxonomy provided'}
+        species = {'coord 1': 'No taxonomy provided'}
 
     s = save_species(species, output_dir)
     coords = ' '.join([str(x) for x in coordinates])
     context = {'coordinates': coords,
                'label': label,
                's': s
-    }
+               }
 
     # Visualizer
     TEMPLATES = resource_filename(
@@ -536,25 +577,26 @@ def adaptive_distance(
         tree: skbio.TreeNode,
         label: str,
         metadata: Metadata,
-        taxonomy: pd.DataFrame = None
+        taxonomy: pd.DataFrame = None,
+        s: int = 5  # Number of important nodes
     ) -> (skbio.DistanceMatrix,
           skbio.TreeNode,
           csr_matrix,
           OrdinationResults,
-          pd.DataFrame): # type: ignore
+          pd.DataFrame):  # type: ignore
 
-    table, tree, ids, biomtab = match_to_tree(table, tree)
-    meta = _validate(metadata, label, biomtab)
-    _, shl = sparsify(tree)
-    adhld_results = adaptive(shl, table, label,
-                             biomtab, meta, s=5)
+    haar_basis = get_haar_basis(tree)
+    meta = metadata.to_dataframe()
 
-    _, _, _, _, _, _, diagonal = adhld_results
+    adhld_results = adaptive(haar_basis, table, label, tree, meta, s)
 
-    D, modmags = compute_haar_dist(table, shl, diagonal)
+    _, _, _, _, _, _, diagonal, mags = adhld_results
 
+    D, modmags = compute_haar_dist(mags, diagonal)
+
+    ids = table.ids()
     D = skbio.DistanceMatrix(np.array(D.todense()), ids)
-    mm = csr_matrix(modmags)  # Going to see if this works w new format
+    mm = csr_matrix(modmags)
     p = pcoa(D)
 
     feature_metadata = taxonomy
