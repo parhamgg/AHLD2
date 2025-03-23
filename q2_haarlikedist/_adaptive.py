@@ -1,4 +1,6 @@
+import gc
 import numpy as np
+import scipy as sp
 import os
 import time
 
@@ -146,11 +148,8 @@ def proximity_matrix(clf, X, lgbm):
     print(prox)
     print(prox.shape)
 
-
-
     # 2
     # prox = np.sum(np.equal.outer(terminals, terminals), axis=2) / nTrees
-
 
     # 3
     # from joblib import Parallel, delayed
@@ -216,6 +215,51 @@ def spouter(A, B):
                       (N, L * K))
 
 
+def landmark_MDS(D, lands, dim):
+    """https://github.com/danilomotta/LMDS"""
+    Dl = D[:, lands]
+    n = len(Dl)
+
+    # Centering matrix
+    H = - np.ones((n, n))/n
+    np.fill_diagonal(H, 1-1/n)
+    # YY^T
+    H = -H.dot(Dl**2).dot(H)/2
+
+    # Diagonalize
+    evals, evecs = np.linalg.eigh(H)
+
+    # Sort by eigenvalue in descending order
+    idx = np.argsort(evals)[::-1]
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+
+    # Compute the coordinates using positive-eigenvalued components only
+    w, = np.where(evals > 0)
+    if dim:
+        arr = evals
+        w = arr.argsort()[-dim:][::-1]
+        if np.any(evals[w] < 0):
+            print('Error: Not enough positive eigenvalues for the selected dim.')
+            return []
+    if w.size == 0:
+        print('Error: matrix is negative definite.')
+        return []
+
+    V = evecs[:, w]
+    L = V.dot(np.diag(np.sqrt(evals[w]))).T
+    N = D.shape[1]
+    Lh = V.dot(np.diag(1./np.sqrt(evals[w]))).T
+    Dm = D - np.tile(np.mean(Dl, axis=1), (N, 1)).T
+    dim = w.size
+    X = -Lh.dot(Dm)/2.
+    X -= np.tile(np.mean(X, axis=1), (N, 1)).T
+
+    _, evecs = sp.linalg.eigh(X.dot(X.T))
+
+    return (evecs[:, ::-1].T.dot(X)).T
+
+
 def convert_least_squares(affinity, mags, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
@@ -228,18 +272,21 @@ def convert_least_squares(affinity, mags, size_embedding=50):
         sparsegram : transformed signals? some sort of mapping
     """
     print('convert least squares')
-    embedding = MDS(n_components=size_embedding,
-                    dissimilarity='precomputed', n_jobs=-1)
-    # embedding = MDS(n_components=size_embedding, dissimilarity='euclidean', n_jobs=-1)
-    affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
+
+
+    # embedding = MDS(n_components=size_embedding,
+    #                 dissimilarity='precomputed', n_jobs=-1)
+    # affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
+
+    # 2
+    num_landmarks = min(affinity.shape[0], 1000)
+    lands = np.random.choice(affinity.shape[0], num_landmarks, replace=False)
+    embedding = landmark_MDS(affinity, lands, size_embedding)
+    affinity_transformed = csr_matrix(embedding)
+
+
     print(affinity_transformed.shape)
     print(affinity_transformed)
-
-
-    # from umap import UMAP
-    # umap_model = UMAP(n_components=size_embedding)
-    # affinity_transformed = csr_matrix(umap_model.fit_transform(affinity))
-
 
     sparsegram = affinity_transformed @ affinity_transformed.T
     print(sparsegram.shape)
