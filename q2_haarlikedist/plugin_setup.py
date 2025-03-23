@@ -91,7 +91,7 @@ plugin.visualizers.register_function(
     function=adaptive_visual,
     inputs={
         'tree': Phylogeny[Rooted],
-        'table': FeatureTable[Frequency | RelativeFrequency]
+        'biom_table': FeatureTable[Frequency | RelativeFrequency]
     },
     parameters={
         'label': Str,
@@ -105,7 +105,7 @@ plugin.visualizers.register_function(
         'tree': (
             'Phylogeny tree associated with table.'
         ),
-        'table': (
+        'biom_table': (
             'Biom table with samples and OTU IDs (features)'
             'that match tree tip names.'
         )
@@ -137,7 +137,8 @@ plugin.methods.register_function(
     parameters={
         'label': Str,
         'metadata': Metadata,
-        'taxonomy': Metadata
+        'taxonomy': Metadata,
+        's': Int
     },
     outputs=[
         ('distance_matrix', DistanceMatrix),
@@ -155,7 +156,8 @@ plugin.methods.register_function(
                   'for group comparisons. Variable of interest'),
         'metadata': 'Associated metadata that is a superset of samples.',
         'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
-                     'names to species names.')
+                     'names to species names.'),
+        's': ('Number of important nodes to find'),
     },
     output_descriptions={
         'distance_matrix':
@@ -183,5 +185,4 @@ plugin.methods.register_function(
     ]
 )
 
-# importlib.import_module('q2_haarlikedist._transformer')
 import q2_haarlikedist._transformer
