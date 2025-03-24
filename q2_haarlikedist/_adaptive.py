@@ -127,7 +127,7 @@ def proximity_matrix(clf, X, lgbm):
 
     # terminals = index of the leaf in each decision tree that a sample
     # (or samples) would land in. (nsamples x n estimators)
-    print('proximity matrix')
+    print('proximity matrix:')
     if lgbm:
         terminals = clf.predict(X, pred_leaf=True, n_jobs=6)
     else:
@@ -216,48 +216,48 @@ def spouter(A, B):
 
 
 def landmark_MDS(D, lands, dim):
-    """https://github.com/danilomotta/LMDS"""
-    Dl = D[:, lands]
-    n = len(Dl)
+    """based on https://github.com/danilomotta/LMDSParameters:
+        D (ndarray): Full distance matrix of shape (n_samples, n_samples)
+        lands (list or array): Indices of landmark points
+        dim (int): Number of dimensions to project onto
 
-    # Centering matrix
-    H = - np.ones((n, n))/n
-    np.fill_diagonal(H, 1-1/n)
-    # YY^T
-    H = -H.dot(Dl**2).dot(H)/2
+    Returns:
+        ndarray: Low-dimensional embedding of shape (n_samples, dim)
+    """
+    Dl = D[:, lands]  # shape: (n_samples, n_landmarks)
+    n, k = Dl.shape
 
-    # Diagonalize
-    evals, evecs = np.linalg.eigh(H)
+    # Double centering for non-square distance matrix
+    Dl2 = Dl ** 2
+    row_mean = np.mean(Dl2, axis=1, keepdims=True)     # shape (n, 1)
+    col_mean = np.mean(Dl2, axis=0, keepdims=True)     # shape (1, k)
+    total_mean = np.mean(Dl2)                          # scalar
 
-    # Sort by eigenvalue in descending order
-    idx = np.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs = evecs[:, idx]
+    B = -0.5 * (Dl2 - row_mean - col_mean + total_mean)  # shape (n, k)
 
-    # Compute the coordinates using positive-eigenvalued components only
-    w, = np.where(evals > 0)
-    if dim:
-        arr = evals
-        w = arr.argsort()[-dim:][::-1]
-        if np.any(evals[w] < 0):
-            print('Error: Not enough positive eigenvalues for the selected dim.')
-            return []
-    if w.size == 0:
-        print('Error: matrix is negative definite.')
-        return []
+    # SVD decomposition
+    U, S, _ = np.linalg.svd(B, full_matrices=False)
 
-    V = evecs[:, w]
-    L = V.dot(np.diag(np.sqrt(evals[w]))).T
-    N = D.shape[1]
-    Lh = V.dot(np.diag(1./np.sqrt(evals[w]))).T
-    Dm = D - np.tile(np.mean(Dl, axis=1), (N, 1)).T
-    dim = w.size
-    X = -Lh.dot(Dm)/2.
-    X -= np.tile(np.mean(X, axis=1), (N, 1)).T
+    # Keep only significantly positive singular values
+    pos = S > 1e-10  # Filter out numerical noise
+    num_pos = np.count_nonzero(pos)
 
-    _, evecs = sp.linalg.eigh(X.dot(X.T))
+    if num_pos == 0:
+        print("Error: No positive singular values found.")
+        return np.empty((n, 0))  # Return empty array with correct shape
 
-    return (evecs[:, ::-1].T.dot(X)).T
+    # Adjust `dim` to available singular values
+    dim = min(dim, num_pos)
+    print(f"Using {dim} dimensions out of {num_pos} available.")
+
+    # Use top-dim components
+    U = U[:, pos][:, :dim]  # Filter U for valid singular values
+    S = S[pos][:dim]        # Keep top singular values
+
+    # Compute embedding
+    X = U * np.sqrt(S)  # shape: (n, dim)
+
+    return X
 
 
 def convert_least_squares(affinity, mags, size_embedding=50):
@@ -271,24 +271,24 @@ def convert_least_squares(affinity, mags, size_embedding=50):
         A: a csc_matrix which is something??? 
         sparsegram : transformed signals? some sort of mapping
     """
-    print('convert least squares')
+    print('convert least squares:')
 
-
-    # embedding = MDS(n_components=size_embedding,
-    #                 dissimilarity='precomputed', n_jobs=-1)
-    # affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
+    embedding = MDS(n_components=size_embedding,
+                    dissimilarity='precomputed', n_jobs=-1)
+    affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
 
     # 2
-    num_landmarks = min(affinity.shape[0], 1000)
-    lands = np.random.choice(affinity.shape[0], num_landmarks, replace=False)
-    embedding = landmark_MDS(affinity, lands, size_embedding)
-    affinity_transformed = csr_matrix(embedding)
+    # num_landmarks = min(affinity.shape[0], 1000)
+    # lands = np.random.choice(affinity.shape[0], num_landmarks, replace=False)
+    # embedding = landmark_MDS(affinity, lands, size_embedding)
+    # affinity_transformed = csr_matrix(embedding)
 
-
+    print('affinity shape:', end=' ')
     print(affinity_transformed.shape)
     print(affinity_transformed)
 
     sparsegram = affinity_transformed @ affinity_transformed.T
+    print('sparsegram shape:', end=' ')
     print(sparsegram.shape)
 
     nsamples = mags.shape[1]
@@ -297,6 +297,7 @@ def convert_least_squares(affinity, mags, size_embedding=50):
                                 order='F')
     basis_dictionary = spouter(mags, mags).T
     basis_dictionary_sparse = csc_matrix(basis_dictionary)
+    print('basis dictionary shape', basis_dictionary_sparse.shape)
 
     return signal, basis_dictionary_sparse, sparsegram
 
