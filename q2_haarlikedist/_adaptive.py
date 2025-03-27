@@ -1,5 +1,6 @@
 import numpy as np
 import scipy as sp
+import scipy.sparse as spp
 import pandas as pd
 import os
 import time
@@ -130,6 +131,56 @@ def proximity_matrix(clf, X, lgbm):
     return prox
 
 
+def spouter_partitioned(A, B, num_partitions=25):
+    """ 
+    Computes the sparse outer product of two matrices (A, B) in partitions to avoid memory overload.
+    The final shape will be (23122*2, 174809, 1, 174809) as requested.
+    """
+
+    # Get dimensions
+    N, L = A.shape
+    N_, K = B.shape
+
+    # Split rows into partitions
+    row_splits = np.array_split(np.arange(N), num_partitions)
+
+    # Initialize list to store partial results
+    outer_products = []
+
+    # Process each partition
+    for row_indices in row_splits:
+        # Partition the rows of A and B
+        A_partition = A[row_indices, :]
+        B_partition = B[row_indices, :]
+
+        # Compute outer product row-wise for the current partition
+        drows = zip(*(np.split(x.data, x.indptr[1:-1]) for x in (A_partition, B_partition)))
+        data = [np.outer(a, b).ravel() for a, b in drows]
+        irows = zip(*(np.split(x.indices, x.indptr[1:-1]) for x in (A_partition, B_partition)))
+        indices = [
+            np.ravel_multi_index(np.ix_(a, b), (L, K)).ravel()
+            for a, b in irows
+        ]
+        indptr = np.fromiter(chain((0,), map(len, indices)), int).cumsum()
+
+        # Ensure the output is a 2-D sparse matrix
+        outer_products.append(
+            csr_matrix((np.concatenate(data), np.concatenate(indices), indptr), (len(row_indices), L * K))
+        )
+
+    # Check if outer_products contains only 2-D matrices
+    for i, mat in enumerate(outer_products):
+        if mat.shape[0] == 1 or mat.shape[1] == 1:
+            print(f"Warning: Matrix at index {i} is not 2-D as expected: {mat.shape}")
+
+    # Manually combine the results from outer_products by stacking
+    result = spp.vstack(outer_products)
+    print(result.shape)
+    print(result[0].shape)
+
+    return result
+
+
 def spouter(A, B):
     """ Quickly compute sparse outer product
     of two matrices. 
@@ -219,10 +270,11 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
     else:
         print('doing landmark MDS with', end=' ')
         num_landmarks = min(affinity.shape[0], 1000)
-        print('landmarks')
+        print('landmarks', end=' ')
         np.random.seed(0)
         lands = np.random.choice(
             affinity.shape[0], num_landmarks, replace=False)
+        print(lands)
         embedding = landmark_MDS(affinity, lands, size_embedding)
         affinity_transformed = csr_matrix(embedding)
 
@@ -250,10 +302,13 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
     print('signal shape:', signal.shape)
 
     sub_mags = mags[:, medoid_inds]
-    basis_dictionary = spouter(sub_mags, sub_mags).T
-    basis_dictionary_sparse = csc_matrix(basis_dictionary)
+    # basis_dictionary = spouter(sub_mags, sub_mags).T
+    # basis_dictionary_sparse = csc_matrix(basis_dictionary)
+
+    basis_dictionary_sparse = csc_matrix(spouter_partitioned(sub_mags, sub_mags).T)
+
     print('basis dictionary shape', basis_dictionary_sparse.shape,
-          basis_dictionary[0].shape)
+          basis_dictionary_sparse[0].shape)
 
     return signal, basis_dictionary_sparse, sparsegram, medoid_inds
 
@@ -371,8 +426,8 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
 
     # Control Vars. Maybe later add to func args?
     lgbm = False
-    cluster_affinity = True
-    use_landmarkMDS = True
+    cluster_affinity = False
+    use_landmarkMDS = False
     print('running with lgbm=', lgbm, ' cluster_affinity=',
           cluster_affinity, ' lmds=', landmark_MDS, sep='')
 
