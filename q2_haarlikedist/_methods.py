@@ -538,7 +538,10 @@ def adaptive_visual(
     n: int = 5
 ) -> None:
 
+    print('tree tips before align:', len(list(tree.tips())))
     tree, biom_table = match_to_tree(biom_table, tree)
+    print('tree tips after align:', len(list(tree.tips())))
+    
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 

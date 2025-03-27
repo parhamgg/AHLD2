@@ -1,6 +1,6 @@
-import gc
 import numpy as np
 import scipy as sp
+import pandas as pd
 import os
 import time
 
@@ -14,6 +14,8 @@ from sklearn.manifold import MDS
 from sklearn.preprocessing import normalize, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn_extra.cluster import KMedoids
+
 
 import lightgbm as lgb
 
@@ -89,26 +91,11 @@ def preprocess(label, biom_table, haar_basis, metadata, tree):
     print("X shape:", X.shape)
     print(type(X))
     print(X)
-    # row_sum = X.to_numpy().sum(axis=1)
-    # print("\nRow sums (sum along axis=1):")
-    # print(row_sum)
-    # print("\nCheck for NaN or infinite values in row sums:")
-    # print(np.count_nonzero(~np.isnan(row_sum)))  # Count NaN values
-    # print((row_sum == float('inf')).sum())  # Count infinite values
     print("Y shape:", Y.shape)
     print(type(Y))
     print("abundance_vector shape:", abundance_vector.shape)
     print("mags shape:", mags.shape)
     print("haar_basis shape:", haar_basis.shape)
-    # import json
-    # import scipy.sparse as sp
-    # X.to_csv("X_check.csv")
-    # Y.to_csv("Y_check.csv")
-    # np.save('abundance_vector_check.npy', abundance_vector)
-    # sp.save_npz("mags_check.npz", mags)
-    # sp.save_npz('shl_check.npz', csr_matrix(haar_basis))
-    # with open("dic_check.txt", "w") as f:
-    #     json.dump(dic, f)
 
     # Normalize X
     sums = X.to_numpy().sum(axis=1)
@@ -132,63 +119,14 @@ def proximity_matrix(clf, X, lgbm):
         terminals = clf.predict(X, pred_leaf=True, n_jobs=6)
     else:
         terminals = clf.apply(X)
-
     print('tree leaves preds. shape', terminals.shape)
 
     nsamples, nTrees = terminals.shape
-
-    # 1 - orig
     prox = np.zeros((nsamples, nsamples))
-
     for i in range(nTrees):
         a = terminals[:, i]
         prox += 1*np.equal.outer(a, a)
-
-    prox = prox / nTrees
-    print(prox)
-    print(prox.shape)
-
-    # 2
-    # prox = np.sum(np.equal.outer(terminals, terminals), axis=2) / nTrees
-
-    # 3
-    # from joblib import Parallel, delayed
-    # def compute_prox(i):
-    #     """Computes contribution of tree i to proximity matrix."""
-    #     a = terminals[:, i]
-    #     return np.equal.outer(a, a).astype(int)
-    # # Run in parallel across multiple threads
-    # prox = sum(Parallel(n_jobs=-1)(delayed(compute_prox)(i) for i in range(nTrees))) / nTrees
-    # print(prox)
-    # print()
-
-    # # 4
-    # from joblib import Parallel, delayed
-    # def compute_sparse_row(i, terminals):
-    #     """Computes a single row of the sparse dissimilarity matrix."""
-    #     diff = np.sum(terminals[i] == terminals, axis=1) / terminals.shape[1]
-    #     return diff  # Return only the computed row
-    # # Get total number of samples
-    # n_samples = terminals.shape[0]
-    # # Compute dissimilarity matrix in parallel (row-wise)
-    # results = Parallel(n_jobs=-1)(
-    #     delayed(compute_sparse_row)(i, terminals) for i in range(n_samples)
-    # )
-
-    # print(np.array(np.vstack(results)))
-    # print()
-    # # Convert results into a sparse CSR matrix
-    # sparse_dissimilarity = csr_matrix(np.vstack(results))
-
-    # from sklearn.decomposition import TruncatedSVD
-
-    # # Suppose X is large and sparse (e.g., shape [n_samples, n_features])
-    # svd = TruncatedSVD(n_components=600, random_state=42)
-
-    # sparse_dissimilarity_reduced = svd.fit_transform(sparse_dissimilarity)
-
-    # print(sparse_dissimilarity_reduced.shape)
-    # return sparse_dissimilarity_reduced
+    prox = 1 - (prox / nTrees)
     return prox
 
 
@@ -260,7 +198,7 @@ def landmark_MDS(D, lands, dim):
     return X
 
 
-def convert_least_squares(affinity, mags, size_embedding=50):
+def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
         mags: same mags from before
@@ -273,33 +211,51 @@ def convert_least_squares(affinity, mags, size_embedding=50):
     """
     print('convert least squares:')
 
-    embedding = MDS(n_components=size_embedding,
-                    dissimilarity='precomputed', n_jobs=-1)
-    affinity_transformed = csr_matrix(embedding.fit_transform(affinity))
+    if not lmds:
+        print('doing normal MDS')
+        embedder = MDS(n_components=size_embedding,
+                       dissimilarity='precomputed', n_jobs=-1)
+        affinity_transformed = csr_matrix(embedder.fit_transform(affinity))
+    else:
+        print('doing landmark MDS with', end=' ')
+        num_landmarks = min(affinity.shape[0], 1000)
+        print('landmarks')
+        np.random.seed(0)
+        lands = np.random.choice(
+            affinity.shape[0], num_landmarks, replace=False)
+        embedding = landmark_MDS(affinity, lands, size_embedding)
+        affinity_transformed = csr_matrix(embedding)
 
-    # 2
-    # num_landmarks = min(affinity.shape[0], 1000)
-    # lands = np.random.choice(affinity.shape[0], num_landmarks, replace=False)
-    # embedding = landmark_MDS(affinity, lands, size_embedding)
-    # affinity_transformed = csr_matrix(embedding)
-
-    print('affinity shape:', end=' ')
-    print(affinity_transformed.shape)
-    print(affinity_transformed)
+    if clstr:
+        print('clustering samples based on tree-leaf-predictions representation')
+        n_medoids = min(affinity_transformed.shape[0], 1000)
+        medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
+            affinity_transformed).medoid_indices_
+        medoid_inds = medoid_inds.ravel()
+        affinity_transformed = affinity_transformed[medoid_inds]
+        print('medoid inds shape:', medoid_inds.shape)
+        print('affinity shape:', end=' ')
+        print(affinity_transformed.shape)
+    else:
+        n_medoids = affinity_transformed.shape[0]
+        medoid_inds = np.arange(affinity_transformed.shape[0])
 
     sparsegram = affinity_transformed @ affinity_transformed.T
     print('sparsegram shape:', end=' ')
     print(sparsegram.shape)
 
-    nsamples = mags.shape[1]
     signal = csr_matrix.reshape(sparsegram,
-                                ((nsamples**2, 1)),
+                                ((n_medoids**2, 1)),
                                 order='F')
-    basis_dictionary = spouter(mags, mags).T
-    basis_dictionary_sparse = csc_matrix(basis_dictionary)
-    print('basis dictionary shape', basis_dictionary_sparse.shape)
+    print('signal shape:', signal.shape)
 
-    return signal, basis_dictionary_sparse, sparsegram
+    sub_mags = mags[:, medoid_inds]
+    basis_dictionary = spouter(sub_mags, sub_mags).T
+    basis_dictionary_sparse = csc_matrix(basis_dictionary)
+    print('basis dictionary shape', basis_dictionary_sparse.shape,
+          basis_dictionary[0].shape)
+
+    return signal, basis_dictionary_sparse, sparsegram, medoid_inds
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -402,7 +358,7 @@ def train_LGBM(X, Y):
     return bst
 
 
-def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm=False):
+def adaptive(haar_basis, biom_table, label, tree, meta, s):
     """ shl: sparse haar like coordinates
         biom_table_data: biom_table, 
         label: str, column in meta to use 
@@ -413,10 +369,16 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm=False):
         returns dic, rfgram, coordinates, coefs, Y, dic, new_diag
     """
 
+    # Control Vars. Maybe later add to func args?
+    lgbm = False
+    cluster_affinity = True
+    use_landmarkMDS = True
+    print('running with lgbm=', lgbm, ' cluster_affinity=',
+          cluster_affinity, ' lmds=', landmark_MDS, sep='')
+
     X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
     print('preprocessing done.')
 
-    # DEBUG
     if lgbm:
         clf = train_LGBM(X, Y)
     else:
@@ -430,13 +392,19 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm=False):
     rfaffinity = proximity_matrix(clf, X, lgbm)
     print('affinity generated.')
 
-    signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
+    # signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
+    signal, dictionary, rfgram, medoid_indices = convert_least_squares(
+        rfaffinity, mags, clstr=cluster_affinity, lmds=use_landmarkMDS)
+    Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
+    mags = mags[:, medoid_indices]
+
     signal = csc_matrix(signal)
     print('signal created.')
 
     coordinates, coefs = matching_pursuit(signal, dictionary, s)
     print('signal estimated with Haar coefs.')
     new_diag = diag_impo(mags, coordinates, coefs)
+    print('diag created.')
 
     return dic, rfgram, coordinates, coefs, Y, dic, new_diag, mags
 
