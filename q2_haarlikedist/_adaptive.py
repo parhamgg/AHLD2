@@ -131,7 +131,7 @@ def proximity_matrix(clf, X, lgbm):
     return prox
 
 
-def spouter_partitioned(A, B, num_partitions=25):
+def spouter_partitioned(A, B, num_partitions=50):
     """ 
     Computes the sparse outer product of two matrices (A, B) in partitions to avoid memory overload.
     The final shape will be (23122*2, 174809, 1, 174809) as requested.
@@ -148,7 +148,10 @@ def spouter_partitioned(A, B, num_partitions=25):
     outer_products = []
 
     # Process each partition
+    i = 0
     for row_indices in row_splits:
+        print(i)
+        i += 1
         # Partition the rows of A and B
         A_partition = A[row_indices, :]
         B_partition = B[row_indices, :]
