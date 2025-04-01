@@ -17,6 +17,8 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn_extra.cluster import KMedoids
 
+from skbio.stats.ordination import pcoa
+
 
 import lightgbm as lgb
 
@@ -131,7 +133,7 @@ def proximity_matrix(clf, X, lgbm):
     return prox
 
 
-def spouter_partitioned(A, B, num_partitions=50):
+def spouter_partitioned(A, B, num_partitions=500):
     """ 
     Computes the sparse outer product of two matrices (A, B) in partitions to avoid memory overload.
     The final shape will be (23122*2, 174809, 1, 174809) as requested.
@@ -139,47 +141,43 @@ def spouter_partitioned(A, B, num_partitions=50):
 
     # Get dimensions
     N, L = A.shape
-    N_, K = B.shape
+    _, K = B.shape
 
     # Split rows into partitions
     row_splits = np.array_split(np.arange(N), num_partitions)
 
     # Initialize list to store partial results
-    outer_products = []
+    sparse_partitions = []  # Store sparse partitions
 
-    # Process each partition
-    i = 0
     for row_indices in row_splits:
-        print(i)
-        i += 1
+
         # Partition the rows of A and B
         A_partition = A[row_indices, :]
         B_partition = B[row_indices, :]
 
         # Compute outer product row-wise for the current partition
-        drows = zip(*(np.split(x.data, x.indptr[1:-1]) for x in (A_partition, B_partition)))
-        data = [np.outer(a, b).ravel() for a, b in drows]
-        irows = zip(*(np.split(x.indices, x.indptr[1:-1]) for x in (A_partition, B_partition)))
-        indices = [
-            np.ravel_multi_index(np.ix_(a, b), (L, K)).ravel()
-            for a, b in irows
-        ]
-        indptr = np.fromiter(chain((0,), map(len, indices)), int).cumsum()
+        drows = zip(*(np.split(x.data, x.indptr[1:-1])
+                    for x in (A_partition, B_partition)))
+        irows = zip(
+            *(np.split(x.indices, x.indptr[1:-1]) for x in (A_partition, B_partition)))
 
-        # Ensure the output is a 2-D sparse matrix
-        outer_products.append(
-            csr_matrix((np.concatenate(data), np.concatenate(indices), indptr), (len(row_indices), L * K))
-        )
+        sparse_outer_products = []
+        for (a, b), (a_idx, b_idx) in zip(drows, irows):
+            indices = np.ravel_multi_index(
+                np.ix_(a_idx, b_idx), (L, K)).ravel()
+            sparse_outer_products.append(
+                csr_matrix((np.outer(a, b).ravel(), indices, np.array(
+                    [0, len(indices)])), shape=(1, L * K))
+            )
 
-    # Check if outer_products contains only 2-D matrices
-    for i, mat in enumerate(outer_products):
-        if mat.shape[0] == 1 or mat.shape[1] == 1:
-            print(f"Warning: Matrix at index {i} is not 2-D as expected: {mat.shape}")
+        # Stack all row-wise sparse outer products into a single partition matrix
+        partition_result = spp.vstack(sparse_outer_products)
+        sparse_partitions.append(partition_result)
 
-    # Manually combine the results from outer_products by stacking
-    result = spp.vstack(outer_products)
-    print(result.shape)
-    print(result[0].shape)
+    # Combine all partition results into a single sparse matrix
+    result = spp.vstack(sparse_partitions)
+
+    print(f'Type of result: {type(result)}')
 
     return result
 
@@ -266,13 +264,21 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
     print('convert least squares:')
 
     if not lmds:
-        print('doing normal MDS')
-        embedder = MDS(n_components=size_embedding,
-                       dissimilarity='precomputed', n_jobs=-1)
-        affinity_transformed = csr_matrix(embedder.fit_transform(affinity))
+        # print('doing normal MDS')
+        # embedder = MDS(n_components=size_embedding,
+        #                dissimilarity='precomputed', n_jobs=-1)
+        # affinity_transformed = csr_matrix(embedder.fit_transform(affinity))
+
+        # Perform PCoA with FSVD
+        ordination_results = pcoa(
+            affinity, method='fsvd', number_of_dimensions=size_embedding)
+
+        # Extract the transformed coordinates
+        affinity_transformed = csr_matrix(ordination_results.samples.values)
+
     else:
         print('doing landmark MDS with', end=' ')
-        num_landmarks = min(affinity.shape[0], 1000)
+        num_landmarks = min(affinity.shape[0], 5000)
         print('landmarks', end=' ')
         np.random.seed(0)
         lands = np.random.choice(
@@ -283,7 +289,7 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
 
     if clstr:
         print('clustering samples based on tree-leaf-predictions representation')
-        n_medoids = min(affinity_transformed.shape[0], 1000)
+        n_medoids = min(affinity_transformed.shape[0], 2000)
         medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
             affinity_transformed).medoid_indices_
         medoid_inds = medoid_inds.ravel()
@@ -308,7 +314,8 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
     # basis_dictionary = spouter(sub_mags, sub_mags).T
     # basis_dictionary_sparse = csc_matrix(basis_dictionary)
 
-    basis_dictionary_sparse = csc_matrix(spouter_partitioned(sub_mags, sub_mags).T)
+    basis_dictionary_sparse = csc_matrix(
+        spouter_partitioned(sub_mags, sub_mags).T)
 
     print('basis dictionary shape', basis_dictionary_sparse.shape,
           basis_dictionary_sparse[0].shape)
