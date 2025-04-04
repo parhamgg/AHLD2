@@ -1,6 +1,4 @@
 import numpy as np
-import scipy as sp
-import scipy.sparse as spp
 import pandas as pd
 import os
 import time
@@ -9,7 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from itertools import chain
-from scipy.sparse import linalg, csr_matrix, csc_matrix
+from scipy.sparse import linalg, csr_matrix, csc_matrix, coo_matrix, vstack
 
 from sklearn.manifold import MDS
 from sklearn.preprocessing import normalize, StandardScaler
@@ -133,51 +131,65 @@ def proximity_matrix(clf, X, lgbm):
     return prox
 
 
-def spouter_partitioned(A, B, num_partitions=500):
+def spouter_partitioned(A, B, num_partitions=5000):
     """ 
-    Computes the sparse outer product of two matrices (A, B) in partitions to avoid memory overload.
-    The final shape will be (23122*2, 174809, 1, 174809) as requested.
+    Computes the sparse outer product of two sparse matrices A and B in partitions.
+    Optimized to avoid memory overload using float32 and COO construction.
     """
 
-    # Get dimensions
+    # Get matrix shapes
     N, L = A.shape
     _, K = B.shape
 
-    # Split rows into partitions
+    # Partition rows to reduce memory pressure
     row_splits = np.array_split(np.arange(N), num_partitions)
 
-    # Initialize list to store partial results
-    sparse_partitions = []  # Store sparse partitions
+    # To collect all row-wise sparse outer products
+    sparse_partitions = []
 
     for row_indices in row_splits:
-
-        # Partition the rows of A and B
-        A_partition = A[row_indices, :]
-        B_partition = B[row_indices, :]
-
-        # Compute outer product row-wise for the current partition
-        drows = zip(*(np.split(x.data, x.indptr[1:-1])
-                    for x in (A_partition, B_partition)))
-        irows = zip(
-            *(np.split(x.indices, x.indptr[1:-1]) for x in (A_partition, B_partition)))
+        # Get submatrices and ensure float32 for lower memory usage
+        A_partition = A[row_indices].astype(np.float32)
+        B_partition = B[row_indices].astype(np.float32)
 
         sparse_outer_products = []
-        for (a, b), (a_idx, b_idx) in zip(drows, irows):
-            indices = np.ravel_multi_index(
-                np.ix_(a_idx, b_idx), (L, K)).ravel()
-            sparse_outer_products.append(
-                csr_matrix((np.outer(a, b).ravel(), indices, np.array(
-                    [0, len(indices)])), shape=(1, L * K))
-            )
 
-        # Stack all row-wise sparse outer products into a single partition matrix
-        partition_result = spp.vstack(sparse_outer_products)
+        for i in range(A_partition.shape[0]):
+            a = A_partition[i].data
+            a_idx = A_partition[i].indices
+
+            b = B_partition[i].data
+            b_idx = B_partition[i].indices
+
+            row_inds = []
+            col_inds = []
+            data = []
+
+            # Only compute for non-zero pairs
+            for ai, av in zip(a_idx, a):
+                for bi, bv in zip(b_idx, b):
+                    row_inds.append(0)  # single-row matrix
+                    col_inds.append(ai * K + bi)
+                    data.append(av * bv)
+
+            if data:
+                row_sparse = coo_matrix(
+                    (data, (row_inds, col_inds)), shape=(1, L * K), dtype=np.float32
+                ).tocsr()
+            else:
+                row_sparse = csr_matrix((1, L * K), dtype=np.float32)
+
+            sparse_outer_products.append(row_sparse)
+
+        # Stack all sparse rows in this partition
+        partition_result = vstack(sparse_outer_products)
         sparse_partitions.append(partition_result)
 
-    # Combine all partition results into a single sparse matrix
-    result = spp.vstack(sparse_partitions)
+    # Combine all partitions
+    result = vstack(sparse_partitions)
 
-    print(f'Type of result: {type(result)}')
+    print(
+        f'Type of result: {type(result)}, dtype: {result.dtype}, shape: {result.shape}')
 
     return result
 
@@ -250,7 +262,63 @@ def landmark_MDS(D, lands, dim):
     return X
 
 
-def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embedding=50):
+def select_hybrid_balanced_medoids(affinity, labels, target_total=2000, random_state=0):
+    """
+    Hybrid approach to select balanced medoids:
+    - Includes all samples from underrepresented labels if < target_per_label
+    - Performs medoid clustering on remaining labels to match total count
+
+    Parameters:
+        affinity (np.ndarray or sparse matrix): Affinity matrix (n_samples, n_features)
+        labels (array-like): Label array of shape (n_samples,)
+        target_total (int): Desired total number of medoids
+        random_state (int): Random seed
+
+    Returns:
+        np.ndarray: Selected medoid indices
+    """
+    labels = np.array(labels)
+    unique_labels, _ = np.unique(labels, return_counts=True)
+    label_to_indices = {label: np.where(labels == label)[
+        0] for label in unique_labels}
+    n_labels = len(unique_labels)
+
+    target_per_label = target_total // n_labels
+    selected_indices = []
+    remaining_labels = []
+    remaining_slots = 0
+
+    for label in unique_labels:
+        idxs = label_to_indices[label]
+        n = len(idxs)
+
+        if n <= target_per_label:
+            # Take all if not enough for full clustering
+            selected_indices.extend(idxs)
+            remaining_slots += target_per_label - n
+        else:
+            # Save for clustering later
+            remaining_labels.append((label, idxs))
+
+    if remaining_labels:
+        redistribute = remaining_slots // len(remaining_labels)
+        for label, idxs in remaining_labels:
+            n_clusters = target_per_label + redistribute
+            n_clusters = min(n_clusters, len(idxs))  # Just in case
+
+            X_label = affinity[idxs]
+            if hasattr(X_label, 'toarray'):
+                X_label = X_label.toarray()
+
+            km = KMedoids(n_clusters=n_clusters,
+                          random_state=random_state).fit(X_label)
+            medoids = [idxs[i] for i in km.medoid_indices_]
+            selected_indices.extend(medoids)
+
+    return np.array(selected_indices)
+
+
+def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embedding=10):
     """ Parameters:
         affinity: rf affinity matrix
         mags: same mags from before
@@ -289,11 +357,15 @@ def convert_least_squares(affinity, mags, lmds=False, clstr=False, size_embeddin
 
     if clstr:
         print('clustering samples based on tree-leaf-predictions representation')
-        n_medoids = min(affinity_transformed.shape[0], 2000)
-        medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
-            affinity_transformed).medoid_indices_
-        medoid_inds = medoid_inds.ravel()
-        affinity_transformed = affinity_transformed[medoid_inds]
+        # n_medoids = min(affinity_transformed.shape[0], 2000)
+        # medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
+        #     affinity_transformed).medoid_indices_
+        # medoid_inds = medoid_inds.ravel()
+        # affinity_transformed = affinity_transformed[medoid_inds]
+        selected_indices = select_hybrid_balanced_medoids(
+            affinity, Y, target_total=2000)
+        affinity_transformed = affinity[selected_indices]
+        medoid_inds = np.arange(len(selected_indices))
         print('medoid inds shape:', medoid_inds.shape)
         print('affinity shape:', end=' ')
         print(affinity_transformed.shape)
@@ -439,7 +511,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
     cluster_affinity = False
     use_landmarkMDS = False
     print('running with lgbm=', lgbm, ' cluster_affinity=',
-          cluster_affinity, ' lmds=', landmark_MDS, sep='')
+          cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
 
     X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
     print('preprocessing done.')
@@ -459,7 +531,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
 
     # signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
     signal, dictionary, rfgram, medoid_indices = convert_least_squares(
-        rfaffinity, mags, clstr=cluster_affinity, lmds=use_landmarkMDS)
+        rfaffinity, mags, Y, clstr=cluster_affinity, lmds=use_landmarkMDS)
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
     mags = mags[:, medoid_indices]
 
