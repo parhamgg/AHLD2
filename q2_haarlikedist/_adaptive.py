@@ -262,63 +262,72 @@ def landmark_MDS(D, lands, dim):
     return X
 
 
-def select_hybrid_balanced_medoids(affinity, labels, target_total=2000, random_state=0):
+def select_hybrid_balanced_medoids(affinity, Y, target_total=2000, random_state=0, verbose=True):
     """
-    Hybrid approach to select balanced medoids:
-    - Includes all samples from underrepresented labels if < target_per_label
-    - Performs medoid clustering on remaining labels to match total count
-
-    Parameters:
-        affinity (np.ndarray or sparse matrix): Affinity matrix (n_samples, n_features)
-        labels (array-like): Label array of shape (n_samples,)
-        target_total (int): Desired total number of medoids
-        random_state (int): Random seed
-
-    Returns:
-        np.ndarray: Selected medoid indices
+    Hybrid medoid selection:
+    - Includes all points from small labels (≤ target_per_label)
+    - Uses KMedoids on larger labels to match target_total exactly
+    - Maintains original row order
     """
-    labels = np.array(labels)
-    unique_labels, _ = np.unique(labels, return_counts=True)
-    label_to_indices = {label: np.where(labels == label)[
-        0] for label in unique_labels}
+    labels = np.array(Y)
+    unique_labels = np.unique(labels)
+    print('Y', labels)
+    print('unique', unique_labels)
+    label_to_indices = {label: np.where(labels == label)[0] for label in unique_labels}
     n_labels = len(unique_labels)
-
     target_per_label = target_total // n_labels
-    selected_indices = []
-    remaining_labels = []
-    remaining_slots = 0
 
+    selected_indices = []
+    large_labels = []
+    actual_total = 0
+
+    # Step 1: Handle small labels
     for label in unique_labels:
         idxs = label_to_indices[label]
-        n = len(idxs)
-
-        if n <= target_per_label:
-            # Take all if not enough for full clustering
-            selected_indices.extend(idxs)
-            remaining_slots += target_per_label - n
+        if len(idxs) <= target_per_label:
+            selected_indices.extend(idxs.tolist())
+            actual_total += len(idxs)
         else:
-            # Save for clustering later
-            remaining_labels.append((label, idxs))
+            large_labels.append((label, idxs))
 
-    if remaining_labels:
-        redistribute = remaining_slots // len(remaining_labels)
-        for label, idxs in remaining_labels:
-            n_clusters = target_per_label + redistribute
-            n_clusters = min(n_clusters, len(idxs))  # Just in case
+    # Step 2: Distribute remaining medoids across larger labels
+    remaining_slots = target_total - actual_total
+    if verbose:
+        print(f"Total from small labels: {actual_total}")
+        print(f"Remaining slots: {remaining_slots} for {len(large_labels)} labels")
+
+    if large_labels and remaining_slots > 0:
+        base_per_label = remaining_slots // len(large_labels)
+        extras = remaining_slots % len(large_labels)
+
+        for i, (label, idxs) in enumerate(large_labels):
+            n_clusters = base_per_label + (1 if i < extras else 0)
+            n_clusters = min(n_clusters, len(idxs))  # safety check
 
             X_label = affinity[idxs]
-            if hasattr(X_label, 'toarray'):
+            if hasattr(X_label, "toarray"):
                 X_label = X_label.toarray()
 
-            km = KMedoids(n_clusters=n_clusters,
-                          random_state=random_state).fit(X_label)
-            medoids = [idxs[i] for i in km.medoid_indices_]
+            km = KMedoids(n_clusters=n_clusters, random_state=random_state).fit(X_label)
+            medoids = [idxs[j] for j in km.medoid_indices_]
             selected_indices.extend(medoids)
+    
 
-    return np.array(selected_indices)
+    if len(selected_indices) != target_total:
+        raise ValueError(f"Expected {target_total} medoids but got {len(selected_indices)}.")
+
+    # Preserve order
+    ordered_indices = sorted(selected_indices)
+
+    if len(ordered_indices) != target_total:
+        raise ValueError("Mismatch after ordering — likely duplicate trimming removed too much.")
+
+    return np.array(ordered_indices)
 
 
-def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embedding=10):
+
+
+def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
         mags: same mags from before
@@ -340,7 +349,6 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
         # Perform PCoA with FSVD
         ordination_results = pcoa(
             affinity, method='fsvd', number_of_dimensions=size_embedding)
-
         # Extract the transformed coordinates
         affinity_transformed = csr_matrix(ordination_results.samples.values)
 
@@ -355,36 +363,34 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
         embedding = landmark_MDS(affinity, lands, size_embedding)
         affinity_transformed = csr_matrix(embedding)
 
-    if clstr:
+    if clstr and affinity_transformed.shape[0] > 2000:
         print('clustering samples based on tree-leaf-predictions representation')
-        # n_medoids = min(affinity_transformed.shape[0], 2000)
+
+        # n_medoids = 2000
         # medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
         #     affinity_transformed).medoid_indices_
         # medoid_inds = medoid_inds.ravel()
         # affinity_transformed = affinity_transformed[medoid_inds]
-        selected_indices = select_hybrid_balanced_medoids(
-            affinity, Y, target_total=2000)
-        affinity_transformed = affinity[selected_indices]
-        medoid_inds = np.arange(len(selected_indices))
+
+        medoid_inds = select_hybrid_balanced_medoids(affinity, Y)
+        affinity_transformed = affinity_transformed[medoid_inds]
         print('medoid inds shape:', medoid_inds.shape)
         print('affinity shape:', end=' ')
         print(affinity_transformed.shape)
     else:
-        n_medoids = affinity_transformed.shape[0]
         medoid_inds = np.arange(affinity_transformed.shape[0])
 
+    affinity_transformed = csr_matrix(affinity_transformed)
     sparsegram = affinity_transformed @ affinity_transformed.T
     print('sparsegram shape:', end=' ')
     print(sparsegram.shape)
 
-    signal = csr_matrix.reshape(sparsegram,
-                                ((n_medoids**2, 1)),
-                                order='F')
+    signal = csr_matrix(sparsegram.reshape(
+        (sparsegram.shape[0]**2, 1), order='F'))
+
     print('signal shape:', signal.shape)
 
     sub_mags = mags[:, medoid_inds]
-    # basis_dictionary = spouter(sub_mags, sub_mags).T
-    # basis_dictionary_sparse = csc_matrix(basis_dictionary)
 
     basis_dictionary_sparse = csc_matrix(
         spouter_partitioned(sub_mags, sub_mags).T)
@@ -509,7 +515,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
     # Control Vars. Maybe later add to func args?
     lgbm = False
     cluster_affinity = False
-    use_landmarkMDS = False
+    use_landmarkMDS = True
     print('running with lgbm=', lgbm, ' cluster_affinity=',
           cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
 
