@@ -535,17 +535,24 @@ def adaptive_visual(
     taxonomy: Metadata = None,
     s: int = 5,  # Number of important nodes
     k: int = 5,
-    n: int = 5
+    n: int = 5,
+    lgbm: bool = False,
+    use_landmarkmds: bool = True,
+    num_lmds: int = 5000,
+    cluster_affinity: bool = True,
+    num_clstr: int = 2000,
+    num_sparse_partitions: int = 500
 ) -> None:
 
     print('tree tips before align:', len(list(tree.tips())))
     tree, biom_table = match_to_tree(biom_table, tree)
     print('tree tips after align:', len(list(tree.tips())))
-    
+
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 
-    adhld_results = adaptive(haar_basis, biom_table, label, tree, meta, s)
+    adhld_results = adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm,
+                             use_landmarkmds, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
 

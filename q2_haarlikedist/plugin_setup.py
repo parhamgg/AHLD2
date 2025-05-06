@@ -1,8 +1,6 @@
 import importlib
 
-from qiime2.plugin import (Plugin, Citations,
-                           MetadataColumn, Str, Int,
-                           Categorical, Metadata)
+from qiime2.plugin import (Plugin, Citations, Str, Int, Bool, Metadata)
 
 
 # from skbio.stats.distance import DistanceMatrix
@@ -14,7 +12,6 @@ from q2_types.feature_table import (FeatureTable,
 from q2_types.distance_matrix import DistanceMatrix
 from q2_types.tree import (Phylogeny, Rooted)
 from q2_types.feature_data import (FeatureData, Taxonomy)
-
 
 
 from q2_haarlikedist._methods import (haar_like_dist,
@@ -99,7 +96,13 @@ plugin.visualizers.register_function(
         'taxonomy': Metadata,
         's': Int,
         'k': Int,
-        'n': Int
+        'n': Int,
+        'lgbm': Bool,
+        'use_landmarkmds': Bool,
+        'num_lmds': Int,
+        'cluster_affinity': Bool,
+        'num_clstr': Int,
+        'num_sparse_partitions': Int
     },
     input_descriptions={
         'tree': (
@@ -117,11 +120,23 @@ plugin.visualizers.register_function(
         'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
                      'names to species names.'),
         's': ('Number of important nodes to find'),
-        'k': ('for PCoA reconstruction'),  #TODO: update with more info
-        'n': ('for PCoA reconstruction'),  #TODO: update with more info
+        'k': ('for PCoA reconstruction'),  # TODO: update with more info
+        'n': ('for PCoA reconstruction'),  # TODO: update with more info
+        'lgbm': ('Use LightGBM classifier for faster RF prediction '
+                 '(default: False).'),
+        'use_landmarkmds': ('Use Landmark MDS when sample size is big '
+                            '(default: True).'),
+        'num_lmds': ('Number of landmarks to use for Landmark MDS '
+                     '(default: 5000).'),
+        'cluster_affinity': ('Subsampling with clustering of tree representation affinity when sample size is big '
+                             '(default: True).'),
+        'num_clstr': ('Number of clusters for clustering step '
+                      '(default: 2000).'),
+        'num_sparse_partitions': ('Number of partitions for sparse outer product calculations. More is required for larger cluster size, but is slower. '
+                                  '(default: 500).'),
     },
     name='adaptive-visual',
-    description='Computes haar-like-distance between samples using new' \
+    description='Computes haar-like-distance between samples using new'
                 'supervised method',
     citations=[
         citations['Gorman2022'],
@@ -174,7 +189,7 @@ plugin.methods.register_function(
              'in several different ways.'),
         'pcoa':
             ('PCoA plot of the distance matrix.'),
-        'feature_metadata': 
+        'feature_metadata':
             ('Metadata file with information on tree tips '
              'and internal nodes.')
     },

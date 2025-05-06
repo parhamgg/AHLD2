@@ -262,7 +262,7 @@ def landmark_MDS(D, lands, dim):
     return X
 
 
-def select_hybrid_balanced_medoids(affinity, Y, target_total=2000, random_state=0, verbose=True):
+def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, verbose=True):
     """
     Hybrid medoid selection:
     - Includes all points from small labels (≤ target_per_label)
@@ -273,7 +273,8 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total=2000, random_state=
     unique_labels = np.unique(labels)
     print('Y', labels)
     print('unique', unique_labels)
-    label_to_indices = {label: np.where(labels == label)[0] for label in unique_labels}
+    label_to_indices = {label: np.where(labels == label)[
+        0] for label in unique_labels}
     n_labels = len(unique_labels)
     target_per_label = target_total // n_labels
 
@@ -294,7 +295,8 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total=2000, random_state=
     remaining_slots = target_total - actual_total
     if verbose:
         print(f"Total from small labels: {actual_total}")
-        print(f"Remaining slots: {remaining_slots} for {len(large_labels)} labels")
+        print(
+            f"Remaining slots: {remaining_slots} for {len(large_labels)} labels")
 
     if large_labels and remaining_slots > 0:
         base_per_label = remaining_slots // len(large_labels)
@@ -308,26 +310,26 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total=2000, random_state=
             if hasattr(X_label, "toarray"):
                 X_label = X_label.toarray()
 
-            km = KMedoids(n_clusters=n_clusters, random_state=random_state).fit(X_label)
+            km = KMedoids(n_clusters=n_clusters,
+                          random_state=random_state).fit(X_label)
             medoids = [idxs[j] for j in km.medoid_indices_]
             selected_indices.extend(medoids)
-    
 
     if len(selected_indices) != target_total:
-        raise ValueError(f"Expected {target_total} medoids but got {len(selected_indices)}.")
+        raise ValueError(
+            f"Expected {target_total} medoids but got {len(selected_indices)}.")
 
     # Preserve order
     ordered_indices = sorted(selected_indices)
 
     if len(ordered_indices) != target_total:
-        raise ValueError("Mismatch after ordering — likely duplicate trimming removed too much.")
+        raise ValueError(
+            "Mismatch after ordering — likely duplicate trimming removed too much.")
 
     return np.array(ordered_indices)
 
 
-
-
-def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embedding=50):
+def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, num_sparse_partitions, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
         mags: same mags from before
@@ -341,11 +343,6 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
     print('convert least squares:')
 
     if not lmds:
-        # print('doing normal MDS')
-        # embedder = MDS(n_components=size_embedding,
-        #                dissimilarity='precomputed', n_jobs=-1)
-        # affinity_transformed = csr_matrix(embedder.fit_transform(affinity))
-
         # Perform PCoA with FSVD
         ordination_results = pcoa(
             affinity, method='fsvd', number_of_dimensions=size_embedding)
@@ -354,7 +351,7 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
 
     else:
         print('doing landmark MDS with', end=' ')
-        num_landmarks = min(affinity.shape[0], 5000)
+        num_landmarks = min(affinity.shape[0], num_lmds)
         print('landmarks', end=' ')
         np.random.seed(0)
         lands = np.random.choice(
@@ -363,16 +360,9 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
         embedding = landmark_MDS(affinity, lands, size_embedding)
         affinity_transformed = csr_matrix(embedding)
 
-    if clstr and affinity_transformed.shape[0] > 2000:
+    if clstr and affinity_transformed.shape[0] > num_clstr:
         print('clustering samples based on tree-leaf-predictions representation')
-
-        # n_medoids = 2000
-        # medoid_inds = KMedoids(n_clusters=n_medoids, random_state=0).fit(
-        #     affinity_transformed).medoid_indices_
-        # medoid_inds = medoid_inds.ravel()
-        # affinity_transformed = affinity_transformed[medoid_inds]
-
-        medoid_inds = select_hybrid_balanced_medoids(affinity, Y)
+        medoid_inds = select_hybrid_balanced_medoids(affinity, Y, num_clstr)
         affinity_transformed = affinity_transformed[medoid_inds]
         print('medoid inds shape:', medoid_inds.shape)
         print('affinity shape:', end=' ')
@@ -393,7 +383,7 @@ def convert_least_squares(affinity, mags, Y, lmds=False, clstr=False, size_embed
     sub_mags = mags[:, medoid_inds]
 
     basis_dictionary_sparse = csc_matrix(
-        spouter_partitioned(sub_mags, sub_mags).T)
+        spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
 
     print('basis dictionary shape', basis_dictionary_sparse.shape,
           basis_dictionary_sparse[0].shape)
@@ -471,7 +461,7 @@ def train_LGBM(X, Y):
     # Prepare LightGBM Datasets
     train_data = lgb.Dataset(X, label=Y_1d_zero_based)
 
-    # LightGBM parameters for a FAST model
+    # LightGBM parameters for a fast model
     params = {
         'objective': objective,
         'metric': metric,
@@ -501,7 +491,7 @@ def train_LGBM(X, Y):
     return bst
 
 
-def adaptive(haar_basis, biom_table, label, tree, meta, s):
+def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions):
     """ shl: sparse haar like coordinates
         biom_table_data: biom_table, 
         label: str, column in meta to use 
@@ -513,9 +503,6 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
     """
 
     # Control Vars. Maybe later add to func args?
-    lgbm = False
-    cluster_affinity = False
-    use_landmarkMDS = True
     print('running with lgbm=', lgbm, ' cluster_affinity=',
           cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
 
@@ -537,7 +524,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s):
 
     # signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
     signal, dictionary, rfgram, medoid_indices = convert_least_squares(
-        rfaffinity, mags, Y, clstr=cluster_affinity, lmds=use_landmarkMDS)
+        rfaffinity, mags, Y, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
     mags = mags[:, medoid_indices]
 
