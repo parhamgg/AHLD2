@@ -552,11 +552,18 @@ def adaptive_visual(
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 
+    if taxonomy:
+        annotated_tree, taxonomy_map = annotate_tree(tree, taxonomy)
+        species = get_species(annotated_tree, coordinates, taxonomy_map)
+    else:
+        taxonomy_map = None
+        species = {'coord 1': 'No taxonomy provided'}
+
     adhld_results = adaptive(
         haar_basis, biom_table, label, tree, meta, s, lgbm,
         use_landmarkmds, num_lmds, cluster_affinity,
         num_clstr, num_sparse_partitions,
-        taxonomy=taxonomy, filter_by_taxonomy=filter_by_taxonomy  # NEW ARGS
+        filter_by_taxonomy, taxonomy_map  # NEW ARGS
     )
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
@@ -565,12 +572,6 @@ def adaptive_visual(
     modmags = modmags.T
 
     make_plots(adhld_results, modmags, output_dir, s, k, n)
-
-    if taxonomy:
-        annotated_tree, taxonomy_map = annotate_tree(tree, taxonomy)
-        species = get_species(annotated_tree, coordinates, taxonomy_map)
-    else:
-        species = {'coord 1': 'No taxonomy provided'}
 
     s = save_species(species, output_dir)
     coords = ' '.join([str(x) for x in coordinates])

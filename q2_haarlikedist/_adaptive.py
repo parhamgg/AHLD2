@@ -546,7 +546,7 @@ def train_LGBM(X, Y):
 def adaptive(
     haar_basis, biom_table, label, tree, meta, s, lgbm,
     use_landmarkMDS, num_lmds, cluster_affinity, num_clstr,
-    num_sparse_partitions, taxonomy=None, filter_by_taxonomy=False  # NEW ARGS
+    num_sparse_partitions, filter_by_taxonomy, tax_map  # NEW ARGS
 ):
     print('running with lgbm=', lgbm, ' cluster_affinity=',
           cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
@@ -565,24 +565,16 @@ def adaptive(
     rfaffinity = proximity_matrix(clf, X, lgbm)
     print('affinity generated.')
 
-    # Internal node names for alignment
-    nontips = [n for n in tree.postorder() if not n.is_tip()]
-    node_names = [str(n.name) for n in nontips]
-
-    taxonomy_map = None
     if filter_by_taxonomy:
-        if taxonomy is None:
+        if tax_map is None:
             raise ValueError(
                 "Taxonomy must be provided if filter_by_taxonomy=True")
-        tree, taxonomy_map = annotate_tree(tree, taxonomy)
-        mags, node_names, taxonomy_map = align_taxonomy_to_mags(
-            mags, node_names, taxonomy_map)
 
     signal, dictionary, rfgram, medoid_indices = convert_least_squares(
         rfaffinity, mags, Y, use_landmarkMDS, num_lmds, cluster_affinity,
         num_clstr, num_sparse_partitions,
         filter_by_taxonomy=filter_by_taxonomy,
-        taxonomy_map=taxonomy_map
+        taxonomy_map=tax_map
     )
 
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
