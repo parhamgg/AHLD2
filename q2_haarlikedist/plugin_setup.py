@@ -102,41 +102,65 @@ plugin.visualizers.register_function(
         'num_lmds': Int,
         'cluster_affinity': Bool,
         'num_clstr': Int,
-        'num_sparse_partitions': Int
+        'num_sparse_partitions': Int,
+        'filter_by_taxonomy': Bool  # ← NEW
     },
     input_descriptions={
         'tree': (
             'Phylogeny tree associated with table.'
         ),
         'biom_table': (
-            'Biom table with samples and OTU IDs (features)'
+            'Biom table with samples and OTU IDs (features) '
             'that match tree tip names.'
         )
     },
     parameter_descriptions={
-        'label': ('Name of metadata column to use '
-                  'for group comparisons. Variable of interest'),
+        'label': (
+            'Name of metadata column to use for group comparisons. '
+            'Variable of interest.'
+        ),
         'metadata': 'Associated metadata that is a superset of samples.',
-        'taxonomy': ('A qiime2 taxonomy file mapping tree tip '
-                     'names to species names.'),
-        's': ('Number of important nodes to find'),
-        'k': ('for PCoA reconstruction'),  # TODO: update with more info
-        'n': ('for PCoA reconstruction'),  # TODO: update with more info
-        'lgbm': ('Use LightGBM classifier for faster RF prediction '
-                 '(default: False).'),
-        'use_landmarkmds': ('Use Landmark MDS when sample size is big '
-                            '(default: True).'),
-        'num_lmds': ('Number of landmarks to use for Landmark MDS '
-                     '(default: 5000).'),
-        'cluster_affinity': ('Subsampling with clustering of tree representation affinity when sample size is big '
-                             '(default: True).'),
-        'num_clstr': ('Number of clusters for clustering step '
-                      '(default: 2000).'),
-        'num_sparse_partitions': ('Number of partitions for sparse outer product calculations. More is required for larger cluster size, but is slower. '
-                                  '(default: 500).'),
+        'taxonomy': (
+            'A qiime2 taxonomy file mapping tree tip '
+            'names to species names.'
+        ),
+        's': 'Number of important nodes to find.',
+        'k': 'for PCoA reconstruction.',  # TODO
+        'n': 'for PCoA reconstruction.',  # TODO
+        'lgbm': (
+            'Use LightGBM classifier for faster RF prediction '
+            '(default: False).'
+        ),
+        'use_landmarkmds': (
+            'Use Landmark MDS when sample size is big '
+            '(default: True).'
+        ),
+        'num_lmds': (
+            'Number of landmarks to use for Landmark MDS '
+            '(default: 5000).'
+        ),
+        'cluster_affinity': (
+            'Subsampling with clustering of tree representation affinity when sample size is big '
+            '(default: True).'
+        ),
+        'num_clstr': (
+            'Number of clusters for clustering step '
+            '(default: 2000).'
+        ),
+        'num_sparse_partitions': (
+            'Number of partitions for sparse outer product calculations. '
+            'More is required for larger cluster size, but is slower. '
+            '(default: 500).'
+        ),
+        'filter_by_taxonomy': (
+            'If True, filters out internal nodes with poor taxonomy resolution '
+            '(e.g., only domain or phylum level, such as d__Bacteria; p__; c__; ...). '
+            'This helps focus on interpretable nodes (e.g., with genus or species-level resolution). '
+            'Default: False.'
+        )
     },
     name='adaptive-visual',
-    description='Computes haar-like-distance between samples using new'
+    description='Computes haar-like-distance between samples using new '
                 'supervised method',
     citations=[
         citations['Gorman2022'],
@@ -199,5 +223,3 @@ plugin.methods.register_function(
         citations['Gorman2022'],
     ]
 )
-
-import q2_haarlikedist._transformer
