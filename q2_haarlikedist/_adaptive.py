@@ -329,45 +329,26 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
     return np.array(ordered_indices)
 
 
-def convert_least_squares(
-    affinity,
-    mags,
-    Y,
-    lmds,
-    num_lmds,
-    clstr,
-    num_clstr,
-    num_sparse_partitions,
-    size_embedding=50,
-    filter_by_taxonomy=False,
-    taxonomy_map=None,
-):
+def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, num_sparse_partitions, size_embedding=50):
     """ Parameters:
         affinity: rf affinity matrix
-        mags: internal node matrix (n_nodes x n_samples)
-        Y: optional labels for clustering
-        lmds: boolean, whether to use landmark MDS
-        num_lmds: number of landmark points for LMDS
-        clstr: boolean, whether to cluster and reduce samples
-        num_clstr: number of clusters (medoids)
-        num_sparse_partitions: for basis dictionary construction
-        size_embedding: size of projected embedding
-        filter_by_taxonomy: whether to exclude poorly resolved taxonomies
-        taxonomy_map: dict mapping internal node names to taxonomy strings
+        mags: same mags from before
 
         Returns:
-        signal: vectorized sparsegram (n_samples^2 x 1)
-        A: basis dictionary as csc_matrix
-        sparsegram: transformed affinity inner-product matrix
-        medoid_inds: indices of selected medoids (if clustering)
+        signal: a n_otus x n_samples**2 
+                 vector of all the sample mapping to the forest
+        A: a csc_matrix which is something??? 
+        sparsegram : transformed signals? some sort of mapping
     """
     print('convert least squares:')
 
-    # Step 1: Embedding
     if not lmds:
+        # Perform PCoA with FSVD
         ordination_results = pcoa(
             affinity, method='fsvd', number_of_dimensions=size_embedding)
+        # Extract the transformed coordinates
         affinity_transformed = csr_matrix(ordination_results.samples.values)
+
     else:
         print('doing landmark MDS with', end=' ')
         num_landmarks = min(affinity.shape[0], num_lmds)
@@ -379,61 +360,28 @@ def convert_least_squares(
         embedding = landmark_MDS(affinity, lands, size_embedding)
         affinity_transformed = csr_matrix(embedding)
 
-    # Step 2: Optional clustering
     if clstr and affinity_transformed.shape[0] > num_clstr:
         print('clustering samples based on tree-leaf-predictions representation')
         medoid_inds = select_hybrid_balanced_medoids(affinity, Y, num_clstr)
         affinity_transformed = affinity_transformed[medoid_inds]
         print('medoid inds shape:', medoid_inds.shape)
-        print('affinity shape:', affinity_transformed.shape)
+        print('affinity shape:', end=' ')
+        print(affinity_transformed.shape)
     else:
         medoid_inds = np.arange(affinity_transformed.shape[0])
 
     affinity_transformed = csr_matrix(affinity_transformed)
     sparsegram = affinity_transformed @ affinity_transformed.T
-    print('sparsegram shape:', sparsegram.shape)
+    print('sparsegram shape:', end=' ')
+    print(sparsegram.shape)
 
     signal = csr_matrix(sparsegram.reshape(
         (sparsegram.shape[0]**2, 1), order='F'))
+
     print('signal shape:', signal.shape)
 
-    # Step 3: Prepare mags
     sub_mags = mags[:, medoid_inds]
 
-    # Step 4: Filter based on taxonomy
-    if filter_by_taxonomy:
-        if taxonomy_map is None:
-            raise ValueError(
-                "taxonomy_map must be provided when filter_by_taxonomy=True")
-
-        def has_sufficient_resolution(tax_str):
-            if not tax_str or tax_str == 'not found':
-                return False
-
-            levels = [level.strip() for level in tax_str.split(';')]
-            
-            # 1. Reject if any level ABOVE class is empty (d__, p__, c__)
-            required_ranks = ['d__', 'p__', 'c__']
-            for level, required_prefix in zip(levels, required_ranks):
-                if not level.startswith(required_prefix):
-                    return False
-                if level == required_prefix:
-                    return False
-            
-            # 2. Require at least class-level has a value (c__Something)
-            return any(level.startswith("c__") and level != "c__" for level in levels)
-
-        keep_inds = [
-            i for i, node_name in enumerate(taxonomy_map)
-            if has_sufficient_resolution(taxonomy_map[node_name])
-        ]
-        print(
-            f"Filtering {mags.shape[0]} internal nodes to {len(keep_inds)} based on taxonomy resolution")
-
-        mags = mags[keep_inds, :]
-        sub_mags = sub_mags[keep_inds, :]
-
-    # Step 5: Sparse basis dictionary
     basis_dictionary_sparse = csc_matrix(
         spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
 
@@ -543,11 +491,18 @@ def train_LGBM(X, Y):
     return bst
 
 
-def adaptive(
-    haar_basis, biom_table, label, tree, meta, s, lgbm,
-    use_landmarkMDS, num_lmds, cluster_affinity, num_clstr,
-    num_sparse_partitions, taxonomy=None, filter_by_taxonomy=False  # NEW ARGS
-):
+def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions):
+    """ shl: sparse haar like coordinates
+        biom_table_data: biom_table, 
+        label: str, column in meta to use 
+        biom_table: skbio.TreeNode
+        meta: pd.dataframe
+        s=5: Number of important nodes to find
+
+        returns dic, rfgram, coordinates, coefs, Y, dic, new_diag
+    """
+
+    # Control Vars. Maybe later add to func args?
     print('running with lgbm=', lgbm, ' cluster_affinity=',
           cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
 
@@ -557,34 +512,19 @@ def adaptive(
     if lgbm:
         clf = train_LGBM(X, Y)
     else:
-        clf = RandomForestClassifier(
-            n_estimators=500, bootstrap=True, min_samples_leaf=1, n_jobs=-1)
+        clf = RandomForestClassifier(n_estimators=500,
+                                     bootstrap=True,
+                                     min_samples_leaf=1,
+                                     n_jobs=-1)
         clf.fit(X, Y)
     print('training done.')
 
     rfaffinity = proximity_matrix(clf, X, lgbm)
     print('affinity generated.')
 
-    # Internal node names for alignment
-    nontips = [n for n in tree.postorder() if not n.is_tip()]
-    node_names = [str(n.name) for n in nontips]
-
-    taxonomy_map = None
-    if filter_by_taxonomy:
-        if taxonomy is None:
-            raise ValueError(
-                "Taxonomy must be provided if filter_by_taxonomy=True")
-        tree, taxonomy_map = annotate_tree(tree, taxonomy)
-        mags, node_names, taxonomy_map = align_taxonomy_to_mags(
-            mags, node_names, taxonomy_map)
-
+    # signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
     signal, dictionary, rfgram, medoid_indices = convert_least_squares(
-        rfaffinity, mags, Y, use_landmarkMDS, num_lmds, cluster_affinity,
-        num_clstr, num_sparse_partitions,
-        filter_by_taxonomy=filter_by_taxonomy,
-        taxonomy_map=taxonomy_map
-    )
-
+        rfaffinity, mags, Y, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
     mags = mags[:, medoid_indices]
 

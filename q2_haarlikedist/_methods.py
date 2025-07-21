@@ -541,8 +541,7 @@ def adaptive_visual(
     num_lmds: int = 5000,
     cluster_affinity: bool = True,
     num_clstr: int = 2000,
-    num_sparse_partitions: int = 500,
-    filter_by_taxonomy: bool = True  # NEW ARG
+    num_sparse_partitions: int = 500
 ) -> None:
 
     print('tree tips before align:', len(list(tree.tips())))
@@ -552,12 +551,8 @@ def adaptive_visual(
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 
-    adhld_results = adaptive(
-        haar_basis, biom_table, label, tree, meta, s, lgbm,
-        use_landmarkmds, num_lmds, cluster_affinity,
-        num_clstr, num_sparse_partitions,
-        taxonomy=taxonomy, filter_by_taxonomy=filter_by_taxonomy  # NEW ARGS
-    )
+    adhld_results = adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm,
+                             use_landmarkmds, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
 
@@ -566,18 +561,24 @@ def adaptive_visual(
 
     make_plots(adhld_results, modmags, output_dir, s, k, n)
 
+    # Get context to send to HTML file
     if taxonomy:
-        annotated_tree, taxonomy_map = annotate_tree(tree, taxonomy)
-        species = get_species(annotated_tree, coordinates, taxonomy_map)
+        annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
+        species = get_species(annotated_tree, coordinates, taxonomy)
     else:
         species = {'coord 1': 'No taxonomy provided'}
 
     s = save_species(species, output_dir)
     coords = ' '.join([str(x) for x in coordinates])
-    context = {'coordinates': coords, 'label': label, 's': s}
+    context = {'coordinates': coords,
+               'label': label,
+               's': s
+               }
 
-    index = os.path.join(resource_filename(
-        'q2_haarlikedist', 'adhld_assets'), 'index.html')
+    # Visualizer
+    TEMPLATES = resource_filename(
+        'q2_haarlikedist', 'adhld_assets')
+    index = os.path.join(TEMPLATES, 'index.html')
     q2templates.render(index, output_dir, context=context)
 
 
