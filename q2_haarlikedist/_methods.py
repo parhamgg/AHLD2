@@ -554,9 +554,10 @@ def adaptive_visual(
 
     if taxonomy:
         annotated_tree, taxonomy_map = annotate_tree(tree, taxonomy)
+        species = get_species(annotated_tree, coordinates, taxonomy_map)
     else:
         taxonomy_map = None
-        
+        species = {'coord 1': 'No taxonomy provided'}
 
     adhld_results = adaptive(
         haar_basis, biom_table, label, tree, meta, s, lgbm,
@@ -566,11 +567,6 @@ def adaptive_visual(
     )
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
-
-    if taxonomy_map is not None and annotated_tree is not None:
-        species = get_species(annotated_tree, coordinates, taxonomy_map)
-    else:
-        species = {'coord 1': 'No taxonomy provided'}
 
     _, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
