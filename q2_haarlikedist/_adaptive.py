@@ -385,6 +385,49 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
     basis_dictionary_sparse = csc_matrix(
         spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
 
+    # ------------------- CONTROL PARAMS ----------------------
+    use_global_signal_score = True
+    score_type = 'l2'
+    max_basis = 10000
+    stream_outer = False
+
+    # -------- Option 1: Global Signal Score Filtering --------
+    if use_global_signal_score:
+        print(
+            f'Filtering basis vectors using global signal score: {score_type}')
+        if score_type == 'l2':
+            scores = np.sqrt(sub_mags.multiply(sub_mags).sum(axis=1)).A1
+        elif score_type == 'var':
+            scores = np.var(sub_mags.toarray(), axis=1)
+        elif score_type == 'mean_abs':
+            scores = np.mean(np.abs(sub_mags.toarray()), axis=1)
+        else:
+            raise ValueError(f'Unsupported score_type: {score_type}')
+
+        ranked_indices = np.argsort(scores)[::-1]
+        if max_basis is not None:
+            ranked_indices = ranked_indices[:max_basis]
+        sub_mags = sub_mags[ranked_indices]
+    else:
+        ranked_indices = None  # All included
+
+    # -------- Option 2: Streaming Outer Product --------
+    if stream_outer:
+        print('Using streaming outer product to compute dictionary')
+        from scipy.sparse import vstack
+        rows = []
+        for i in range(sub_mags.shape[0]):
+            row = sub_mags[i].T @ sub_mags[i]
+            row = row.reshape((-1, 1), order='F')  # column vector
+            rows.append(csr_matrix(row))
+        basis_dictionary_sparse = vstack(rows).T.tocsc()
+    else:
+        print('Computing full outer-product basis dictionary')
+        basis_dictionary_sparse = csc_matrix(
+            spouter_partitioned(sub_mags, sub_mags,
+                                num_partitions=num_sparse_partitions).T
+        )
+
     print('basis dictionary shape', basis_dictionary_sparse.shape,
           basis_dictionary_sparse[0].shape)
 
