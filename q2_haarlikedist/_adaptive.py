@@ -388,7 +388,7 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
     # ------------------- CONTROL PARAMS ----------------------
     use_global_signal_score = True
     score_type = 'l2'
-    max_basis = 10000
+    max_basis = 5000
     stream_outer = False
 
     # -------- Option 1: Global Signal Score Filtering --------
