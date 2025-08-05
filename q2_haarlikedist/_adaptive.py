@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 import time
+import heapq
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -377,21 +378,27 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
 
     signal = csr_matrix(sparsegram.reshape(
         (sparsegram.shape[0]**2, 1), order='F'))
+    signal = csc_matrix(signal)
 
+    ##### Normalizing signal #####
+    norm = np.sqrt(signal.power(2).sum())
+    if norm == 0:
+        raise ValueError("Cannot normalize a zero vector.")
+    signal = signal / norm
+
+    print('signal created.')
     print('signal shape:', signal.shape)
 
     sub_mags = mags[:, medoid_inds]
 
-    basis_dictionary_sparse = csc_matrix(
-        spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
-
+    # ------------- Global Signal Score Filtering -------------
+    # We attempt to reduce number of mag bases to allow computation
+    # over the complete set of samples.
     # ------------------- CONTROL PARAMS ----------------------
     use_global_signal_score = True
     score_type = 'l2'
-    max_basis = 5000
-    stream_outer = False
+    max_basis = 1000
 
-    # -------- Option 1: Global Signal Score Filtering --------
     if use_global_signal_score:
         print(
             f'Filtering basis vectors using global signal score: {score_type}')
@@ -407,31 +414,17 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
         ranked_indices = np.argsort(scores)[::-1]
         if max_basis is not None:
             ranked_indices = ranked_indices[:max_basis]
+        original_indices = ranked_indices.copy()
         sub_mags = sub_mags[ranked_indices]
     else:
         ranked_indices = None  # All included
 
-    # -------- Option 2: Streaming Outer Product --------
-    if stream_outer:
-        print('Using streaming outer product to compute dictionary')
-        from scipy.sparse import vstack
-        rows = []
-        for i in range(sub_mags.shape[0]):
-            row = sub_mags[i].T @ sub_mags[i]
-            row = row.reshape((-1, 1), order='F')  # column vector
-            rows.append(csr_matrix(row))
-        basis_dictionary_sparse = vstack(rows).T.tocsc()
-    else:
-        print('Computing full outer-product basis dictionary')
-        basis_dictionary_sparse = csc_matrix(
-            spouter_partitioned(sub_mags, sub_mags,
-                                num_partitions=num_sparse_partitions).T
-        )
-
+    basis_dictionary_sparse = csc_matrix(
+        spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
     print('basis dictionary shape', basis_dictionary_sparse.shape,
-          basis_dictionary_sparse[0].shape)
+            basis_dictionary_sparse[0].shape)
 
-    return signal, basis_dictionary_sparse, sparsegram, medoid_inds
+    return signal, basis_dictionary_sparse, sparsegram, medoid_inds, original_indices
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -449,7 +442,7 @@ def matching_pursuit(signal, dictionary, s):
 
         maxproj = innerprod[index].todense().item()
 
-        coefs.append(maxproj/linalg.norm(dictionary[:, index]))
+        coefs.append(maxproj / np.linalg.norm(dictionary[:, index].toarray()))
         R = R - maxproj*dictionarynorm[:, index]
 
     return indices, coefs
@@ -475,6 +468,9 @@ def diag_impo(mags, coordinates, coefficients):
 
         coord = coordinates[i]
         coef = coefficients[i]
+        if abs(coef) > 1e10:
+            print(
+                f"Warning: suspiciously large coefficient {coef} at coord {coord}")
 
         if not coord in assigned:
 
@@ -565,17 +561,23 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS
     rfaffinity = proximity_matrix(clf, X, lgbm)
     print('affinity generated.')
 
-    # signal, dictionary, rfgram = convert_least_squares(rfaffinity, mags)
-    signal, dictionary, rfgram, medoid_indices = convert_least_squares(
-        rfaffinity, mags, Y, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
+    signal, dictionary, rfgram, medoid_indices, original_indices = convert_least_squares(
+        rfaffinity,
+        mags,
+        Y,
+        use_landmarkMDS, num_lmds,
+        cluster_affinity, num_clstr,
+        num_sparse_partitions)
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
+
     mags = mags[:, medoid_indices]
 
-    signal = csc_matrix(signal)
-    print('signal created.')
-
     coordinates, coefs = matching_pursuit(signal, dictionary, s)
+    coordinates = [original_indices[i] for i in coordinates]
+    print(coordinates)
+    print(coefs)
     print('signal estimated with Haar coefs.')
+
     new_diag = diag_impo(mags, coordinates, coefs)
     print('diag created.')
 

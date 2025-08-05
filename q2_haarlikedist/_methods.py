@@ -342,7 +342,8 @@ def compute_haar_dist(mags, diagonal):
 
     # columns are samples
     nsamples = mags.shape[1]
-    diagonal_mat = csr_matrix([diagonal] * nsamples)
+    diagonal_clipped = np.maximum(diagonal, 0)
+    diagonal_mat = csr_matrix([diagonal_clipped] * nsamples)
     diagonal_mat_sqrt = np.sqrt(diagonal_mat)
 
     modmags = mags.T.multiply(diagonal_mat_sqrt)
@@ -359,7 +360,20 @@ def compute_haar_dist(mags, diagonal):
 
     D = D + D.T
 
+    # DEBUG
+    diff = (D - D.T).todense()
+    max_asym = np.abs(diff).max()
+    print("Max asymmetry in D:", max_asym)
     # Check if D is symmetric
+    diff = D - D.T
+    if diff.nnz > 0:
+        print('Asymmetry max diff:', np.max(np.abs(diff.data)))
+    else:
+        print('Asymmetry max diff: 0 (matrix is exactly symmetric)')
+
+    print('NaNs in D:', np.isnan(D.data).any())
+    print('Infs in D:', np.isinf(D.data).any())
+
     assert (D != D.T).nnz == 0
 
     return D, modmags
@@ -555,6 +569,15 @@ def adaptive_visual(
                              use_landmarkmds, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
+
+    # DEBUG
+    print("mags shape:", mags.shape)
+    print("diagonal shape:", diagonal.shape)
+    print("Diagonal stats:")
+    print("  min:", np.min(diagonal))
+    print("  max:", np.max(diagonal))
+    print("  any NaN:", np.isnan(diagonal).any())
+    print("  any inf:", np.isinf(diagonal).any())
 
     _, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
