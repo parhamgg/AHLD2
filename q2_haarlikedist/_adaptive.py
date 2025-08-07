@@ -403,9 +403,12 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
         print(
             f'Filtering basis vectors using global signal score: {score_type}')
         if score_type == 'l2':
-            scores = np.sqrt(sub_mags.multiply(sub_mags).sum(axis=1)).A1
+            scores = np.array(sub_mags.multiply(sub_mags).sum(axis=1)).flatten()
         elif score_type == 'var':
-            scores = np.var(sub_mags.toarray(), axis=1)
+            means = np.array(sub_mags.mean(axis=1)).flatten()
+            squared_means = means ** 2
+            mean_of_squares = np.array(sub_mags.multiply(sub_mags).mean(axis=1)).flatten()   
+            scores = mean_of_squares - squared_means
         elif score_type == 'mean_abs':
             scores = np.mean(np.abs(sub_mags.toarray()), axis=1)
         else:
