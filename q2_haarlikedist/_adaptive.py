@@ -2,21 +2,21 @@ import numpy as np
 import pandas as pd
 import os
 import time
-import heapq
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from itertools import chain
-from scipy.sparse import linalg, csr_matrix, csc_matrix, coo_matrix, vstack
+from scipy.sparse import csr_matrix, csc_matrix, coo_matrix, vstack
 
-from sklearn.manifold import MDS
+from sklearn.utils.extmath import randomized_svd
 from sklearn.preprocessing import normalize, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn_extra.cluster import KMedoids
 
-from skbio.stats.ordination import pcoa
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
 
 
 import lightgbm as lgb
@@ -134,64 +134,52 @@ def proximity_matrix(clf, X, lgbm):
 
 def spouter_partitioned(A, B, num_partitions=5000):
     """ 
-    Computes the sparse outer product of two sparse matrices A and B in partitions.
-    Optimized to avoid memory overload using float32 and COO construction.
+    Efficient sparse outer product of two CSR matrices A and B (row-wise).
+    Each row's outer product is flattened into a 1D sparse vector.
     """
 
-    # Get matrix shapes
     N, L = A.shape
     _, K = B.shape
-
-    # Partition rows to reduce memory pressure
     row_splits = np.array_split(np.arange(N), num_partitions)
-
-    # To collect all row-wise sparse outer products
     sparse_partitions = []
 
     for row_indices in row_splits:
-        # Get submatrices and ensure float32 for lower memory usage
-        A_partition = A[row_indices].astype(np.float32)
-        B_partition = B[row_indices].astype(np.float32)
+        A_part = A[row_indices].astype(np.float32)
+        B_part = B[row_indices].astype(np.float32)
 
-        sparse_outer_products = []
+        data = []
+        row_inds = []
+        col_inds = []
 
-        for i in range(A_partition.shape[0]):
-            a = A_partition[i].data
-            a_idx = A_partition[i].indices
+        for row_idx, (a_row, b_row) in enumerate(zip(A_part, B_part)):
+            a_data = a_row.data
+            a_idx = a_row.indices
+            b_data = b_row.data
+            b_idx = b_row.indices
 
-            b = B_partition[i].data
-            b_idx = B_partition[i].indices
+            if len(a_data) == 0 or len(b_data) == 0:
+                continue
 
-            row_inds = []
-            col_inds = []
-            data = []
+            # Kronecker-style flattening for this row
+            vals = np.outer(a_data, b_data).ravel()
+            cols = np.add.outer(a_idx * K, b_idx).ravel()
 
-            # Only compute for non-zero pairs
-            for ai, av in zip(a_idx, a):
-                for bi, bv in zip(b_idx, b):
-                    row_inds.append(0)  # single-row matrix
-                    col_inds.append(ai * K + bi)
-                    data.append(av * bv)
+            row_inds.extend([row_idx] * len(vals))
+            col_inds.extend(cols)
+            data.extend(vals)
 
-            if data:
-                row_sparse = coo_matrix(
-                    (data, (row_inds, col_inds)), shape=(1, L * K), dtype=np.float32
-                ).tocsr()
-            else:
-                row_sparse = csr_matrix((1, L * K), dtype=np.float32)
+        if len(data) > 0:
+            coo = coo_matrix((data, (row_inds, col_inds)), shape=(
+                len(row_indices), L * K), dtype=np.float32)
+            sparse_partitions.append(coo.tocsr())
+        else:
+            sparse_partitions.append(csr_matrix(
+                (len(row_indices), L * K), dtype=np.float32))
 
-            sparse_outer_products.append(row_sparse)
-
-        # Stack all sparse rows in this partition
-        partition_result = vstack(sparse_outer_products)
-        sparse_partitions.append(partition_result)
-
-    # Combine all partitions
     result = vstack(sparse_partitions)
 
     print(
-        f'Type of result: {type(result)}, dtype: {result.dtype}, shape: {result.shape}')
-
+        f"Type of result: {type(result)}, dtype: {result.dtype}, shape: {result.shape}")
     return result
 
 
@@ -263,6 +251,52 @@ def landmark_MDS(D, lands, dim):
     return X
 
 
+def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
+    """
+    Memory-efficient full MDS using randomized SVD.
+    
+    Parameters
+    ----------
+    D : ndarray of shape (n_samples, n_samples)
+        Full distance matrix (symmetric, zero diagonal).
+    dim : int
+        Target embedding dimension.
+    n_oversamples : int
+        Extra dimensions to improve accuracy in randomized SVD.
+    random_state : int or None
+        Seed for reproducibility.
+
+    Returns
+    -------
+    X : ndarray of shape (n_samples, dim)
+        Low-dimensional embedding.
+    """
+    # Squared distances
+    D2 = D ** 2
+
+    # Double centering
+    row_mean = np.mean(D2, axis=1, keepdims=True)
+    col_mean = np.mean(D2, axis=0, keepdims=True)
+    total_mean = np.mean(D2)
+    B = -0.5 * (D2 - row_mean - col_mean + total_mean)
+
+    # Randomized truncated SVD
+    U, S, _ = randomized_svd(
+        B,
+        n_components=dim,
+        n_oversamples=n_oversamples,
+        random_state=random_state
+    )
+
+    # Convert eigenvalues to coordinates
+    pos_mask = S > 1e-12
+    U = U[:, pos_mask]
+    S = S[pos_mask]
+    X = U * np.sqrt(S)
+
+    return X
+
+
 def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, verbose=True):
     """
     Hybrid medoid selection:
@@ -330,36 +364,15 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
     return np.array(ordered_indices)
 
 
-def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, num_sparse_partitions, size_embedding=50):
-    """ Parameters:
-        affinity: rf affinity matrix
-        mags: same mags from before
-
-        Returns:
-        signal: a n_otus x n_samples**2 
-                 vector of all the sample mapping to the forest
-        A: a csc_matrix which is something??? 
-        sparsegram : transformed signals? some sort of mapping
-    """
+def convert_least_squares(affinity, Y, clstr, num_clstr, size_embedding=50):
     print('convert least squares:')
+    st = time.time()
+    
+    print('doing randomized MDS')
+    embedding = mds_full_randomized(affinity, size_embedding)
+    affinity_transformed = csr_matrix(embedding)
+    print(f'MDS time: {time.time() - st}')
 
-    if not lmds:
-        # Perform PCoA with FSVD
-        ordination_results = pcoa(
-            affinity, method='fsvd', number_of_dimensions=size_embedding)
-        # Extract the transformed coordinates
-        affinity_transformed = csr_matrix(ordination_results.samples.values)
-
-    else:
-        print('doing landmark MDS with', end=' ')
-        num_landmarks = min(affinity.shape[0], num_lmds)
-        print('landmarks', end=' ')
-        np.random.seed(0)
-        lands = np.random.choice(
-            affinity.shape[0], num_landmarks, replace=False)
-        print(lands)
-        embedding = landmark_MDS(affinity, lands, size_embedding)
-        affinity_transformed = csr_matrix(embedding)
 
     if clstr and affinity_transformed.shape[0] > num_clstr:
         print('clustering samples based on tree-leaf-predictions representation')
@@ -389,45 +402,7 @@ def convert_least_squares(affinity, mags, Y, lmds, num_lmds, clstr, num_clstr, n
     print('signal created.')
     print('signal shape:', signal.shape)
 
-    sub_mags = mags[:, medoid_inds]
-
-    # ------------- Global Signal Score Filtering -------------
-    # We attempt to reduce number of mag bases to allow computation
-    # over the complete set of samples.
-    # ------------------- CONTROL PARAMS ----------------------
-    use_global_signal_score = True
-    score_type = 'l2'
-    max_basis = 1000
-
-    if use_global_signal_score:
-        print(
-            f'Filtering basis vectors using global signal score: {score_type}')
-        if score_type == 'l2':
-            scores = np.array(sub_mags.multiply(sub_mags).sum(axis=1)).flatten()
-        elif score_type == 'var':
-            means = np.array(sub_mags.mean(axis=1)).flatten()
-            squared_means = means ** 2
-            mean_of_squares = np.array(sub_mags.multiply(sub_mags).mean(axis=1)).flatten()   
-            scores = mean_of_squares - squared_means
-        elif score_type == 'mean_abs':
-            scores = np.mean(np.abs(sub_mags.toarray()), axis=1)
-        else:
-            raise ValueError(f'Unsupported score_type: {score_type}')
-
-        ranked_indices = np.argsort(scores)[::-1]
-        if max_basis is not None:
-            ranked_indices = ranked_indices[:max_basis]
-        original_indices = ranked_indices.copy()
-        sub_mags = sub_mags[ranked_indices]
-    else:
-        ranked_indices = None  # All included
-
-    basis_dictionary_sparse = csc_matrix(
-        spouter_partitioned(sub_mags, sub_mags, num_partitions=num_sparse_partitions).T)
-    print('basis dictionary shape', basis_dictionary_sparse.shape,
-            basis_dictionary_sparse[0].shape)
-
-    return signal, basis_dictionary_sparse, sparsegram, medoid_inds, original_indices
+    return signal, sparsegram, medoid_inds
 
 
 def matching_pursuit(signal, dictionary, s):
@@ -447,6 +422,134 @@ def matching_pursuit(signal, dictionary, s):
 
         coefs.append(maxproj / np.linalg.norm(dictionary[:, index].toarray()))
         R = R - maxproj*dictionarynorm[:, index]
+
+    return indices, coefs
+
+
+def _score_chunk_return_arrays(chunk_indices, sub_chunk, M, row_sq_norms):
+    """
+    Compute scores for a chunk and return arrays aligned with chunk_indices.
+    Returns (chunk_indices, nums_array, denoms_array, scores_array)
+    All arrays use float64 and preserve the same index order as chunk_indices.
+    """
+    n_local = len(chunk_indices)
+    nums = np.zeros(n_local, dtype=np.float64)
+    denoms = np.zeros(n_local, dtype=np.float64)
+    scores = np.full(n_local, -np.inf, dtype=np.float64)
+
+    for local_i, global_i in enumerate(chunk_indices):
+        u = sub_chunk.getrow(local_i).T  # column (n_samples, 1), sparse
+        if u.nnz == 0:
+            # leave score = -inf
+            continue
+
+        # exact same matvec order as serial: tmp = M @ u; then num = u.T @ tmp
+        tmp = M.dot(u)
+
+        # get scalar robustly from 1x1 sparse result
+        tmpmat = u.T.dot(tmp)
+        if getattr(tmpmat, "nnz", 0):
+            num = float(tmpmat.data[0])
+        else:
+            num = 0.0
+
+        denom = float(row_sq_norms[global_i])  # ensure float64
+
+        if denom == 0.0:
+            # avoid division by zero
+            scores[local_i] = -np.inf
+        else:
+            scores[local_i] = num / denom
+
+        nums[local_i] = num
+        denoms[local_i] = denom
+
+    return chunk_indices, nums, denoms, scores
+
+
+def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
+    """
+    Parallel matching pursuit that is exact-equivalent to the serial implementation.
+    - signal: sparse vector (n_samples**2, 1), Fortran-order vec(M)
+    - sub_mags: csr_matrix, shape (n_bases, n_samples)  <-- each row is u_i
+    - s: number of atoms to select
+    - n_jobs: number of threads (defaults to min(cpu_count(), n_bases))
+
+    Returns: indices, coefs (same semantics as serial matching_pursuit_lazy).
+    """
+    if not isinstance(sub_mags, csr_matrix):
+        sub_mags = csr_matrix(sub_mags)
+
+    # ensure float64 to avoid dtype differences
+    if sub_mags.dtype != np.float64:
+        sub_mags = sub_mags.astype(np.float64)
+
+    n_bases, n_samples = sub_mags.shape
+
+    # reshape signal -> residual matrix M (CSR)
+    R_vec = signal.toarray().ravel()
+    M = csr_matrix(R_vec.reshape((n_samples, n_samples), order='F'), dtype=np.float64)
+
+    # precompute denom (||u||^2) exactly as serial
+    row_sq_norms = np.asarray(sub_mags.power(2).sum(axis=1)).reshape(-1).astype(np.float64)
+
+    # chunking strategy (deterministic)
+    if n_jobs is None:
+        n_jobs = min(cpu_count(), n_bases)
+    else:
+        n_jobs = min(n_jobs, n_bases)
+    all_indices = np.arange(n_bases)
+    chunks = [c for c in np.array_split(all_indices, n_jobs) if len(c) > 0]
+    sub_chunks = [sub_mags[chunk] for chunk in chunks]
+
+    indices = []
+    coefs = []
+
+    # reuse thread pool across iterations for speed
+    with ThreadPoolExecutor(max_workers=n_jobs) as exc:
+        for _ in range(s):
+            # submit scoring jobs for each chunk
+            futures = [
+                exc.submit(_score_chunk_return_arrays, chunks[i], sub_chunks[i], M, row_sq_norms)
+                for i in range(len(chunks))
+            ]
+            # collect chunk outputs and assemble full arrays
+            # create arrays to hold full results in global order
+            nums_full = np.zeros(n_bases, dtype=np.float64)
+            denoms_full = np.zeros(n_bases, dtype=np.float64)
+            scores_full = np.full(n_bases, -np.inf, dtype=np.float64)
+
+            for f in futures:
+                chunk_indices, nums, denoms, scores = f.result()
+                # chunk_indices is a numpy array of global indices; we place results accordingly
+                scores_full[chunk_indices] = scores
+                nums_full[chunk_indices] = nums
+                denoms_full[chunk_indices] = denoms
+
+            # now pick global best (np.argmax picks first occurrence on ties)
+            best_idx = int(np.argmax(scores_full))
+            best_score = float(scores_full[best_idx])
+
+            # if best_score is -inf then no candidate left
+            if not np.isfinite(best_score) or best_score == -np.inf:
+                break
+
+            best_num = float(nums_full[best_idx])
+            best_denom = float(denoms_full[best_idx])
+
+            # reconstruct the chosen atom and update residual exactly as serial
+            u_chosen = sub_mags.getrow(best_idx).toarray().ravel()
+            atom_vec = np.kron(u_chosen, u_chosen)
+            atom_norm = best_denom
+            maxproj = best_score
+
+            coef = maxproj / atom_norm
+            coefs.append(coef)
+            indices.append(best_idx)
+
+            # Update residual vector and M for next iteration
+            R_vec = R_vec - (maxproj / atom_norm) * atom_vec
+            M = csr_matrix(R_vec.reshape((n_samples, n_samples), order='F'), dtype=np.float64)
 
     return indices, coefs
 
@@ -533,7 +636,7 @@ def train_LGBM(X, Y):
     return bst
 
 
-def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions):
+def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, cluster_affinity, num_clstr):
     """ shl: sparse haar like coordinates
         biom_table_data: biom_table, 
         label: str, column in meta to use 
@@ -545,8 +648,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS
     """
 
     # Control Vars. Maybe later add to func args?
-    print('running with lgbm=', lgbm, ' cluster_affinity=',
-          cluster_affinity, ' lmds=', use_landmarkMDS, sep='')
+    print('running with lgbm=', lgbm, ' cluster_affinity=', cluster_affinity, sep='')
 
     X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
     print('preprocessing done.')
@@ -559,27 +661,24 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, use_landmarkMDS
                                      min_samples_leaf=1,
                                      n_jobs=-1)
         clf.fit(X, Y)
-    print('training done.')
+    print('RF training done.')
 
     rfaffinity = proximity_matrix(clf, X, lgbm)
     print('affinity generated.')
 
-    signal, dictionary, rfgram, medoid_indices, original_indices = convert_least_squares(
+    signal, rfgram, medoid_indices = convert_least_squares(
         rfaffinity,
-        mags,
         Y,
-        use_landmarkMDS, num_lmds,
-        cluster_affinity, num_clstr,
-        num_sparse_partitions)
+        cluster_affinity, num_clstr)
     Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
 
     mags = mags[:, medoid_indices]
 
-    coordinates, coefs = matching_pursuit(signal, dictionary, s)
-    coordinates = [original_indices[i] for i in coordinates]
+    st = time.time()
+    coordinates, coefs = matching_pursuit_lazy_parallel(signal, mags, s)
     print(coordinates)
     print(coefs)
-    print('signal estimated with Haar coefs.')
+    print(f'signal estimated with Haar coefs in {time.time() - st} seconds.')
 
     new_diag = diag_impo(mags, coordinates, coefs)
     print('diag created.')

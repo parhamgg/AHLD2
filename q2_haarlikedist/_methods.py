@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import os
 import hashlib
+import time
 
 from skbio import read
 from skbio.tree import TreeNode
@@ -360,20 +361,6 @@ def compute_haar_dist(mags, diagonal):
 
     D = D + D.T
 
-    # DEBUG
-    diff = (D - D.T).todense()
-    max_asym = np.abs(diff).max()
-    print("Max asymmetry in D:", max_asym)
-    # Check if D is symmetric
-    diff = D - D.T
-    if diff.nnz > 0:
-        print('Asymmetry max diff:', np.max(np.abs(diff.data)))
-    else:
-        print('Asymmetry max diff: 0 (matrix is exactly symmetric)')
-
-    print('NaNs in D:', np.isnan(D.data).any())
-    print('Infs in D:', np.isinf(D.data).any())
-
     assert (D != D.T).nnz == 0
 
     return D, modmags
@@ -551,12 +538,11 @@ def adaptive_visual(
     k: int = 5,
     n: int = 5,
     lgbm: bool = False,
-    use_landmarkmds: bool = True,
-    num_lmds: int = 5000,
     cluster_affinity: bool = True,
-    num_clstr: int = 2000,
-    num_sparse_partitions: int = 500
+    num_clstr: int = 2000
 ) -> None:
+
+    starttime = time.time()
 
     print('tree tips before align:', len(list(tree.tips())))
     tree, biom_table = match_to_tree(biom_table, tree)
@@ -565,19 +551,10 @@ def adaptive_visual(
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 
-    adhld_results = adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm,
-                             use_landmarkmds, num_lmds, cluster_affinity, num_clstr, num_sparse_partitions)
+    adhld_results = adaptive(haar_basis, biom_table, label,
+                             tree, meta, s, lgbm, cluster_affinity, num_clstr)
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
-
-    # DEBUG
-    print("mags shape:", mags.shape)
-    print("diagonal shape:", diagonal.shape)
-    print("Diagonal stats:")
-    print("  min:", np.min(diagonal))
-    print("  max:", np.max(diagonal))
-    print("  any NaN:", np.isnan(diagonal).any())
-    print("  any inf:", np.isinf(diagonal).any())
 
     _, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
@@ -603,6 +580,8 @@ def adaptive_visual(
         'q2_haarlikedist', 'adhld_assets')
     index = os.path.join(TEMPLATES, 'index.html')
     q2templates.render(index, output_dir, context=context)
+
+    print(f'adaptive visual took {time.time() - starttime} second to finish.')
 
 
 def adaptive_distance(

@@ -98,11 +98,8 @@ plugin.visualizers.register_function(
         'k': Int,
         'n': Int,
         'lgbm': Bool,
-        'use_landmarkmds': Bool,
-        'num_lmds': Int,
         'cluster_affinity': Bool,
-        'num_clstr': Int,
-        'num_sparse_partitions': Int
+        'num_clstr': Int
     },
     input_descriptions={
         'tree': (
@@ -124,16 +121,10 @@ plugin.visualizers.register_function(
         'n': ('for PCoA reconstruction'),  # TODO: update with more info
         'lgbm': ('Use LightGBM classifier for faster RF prediction '
                  '(default: False).'),
-        'use_landmarkmds': ('Use Landmark MDS when sample size is big '
-                            '(default: True).'),
-        'num_lmds': ('Number of landmarks to use for Landmark MDS '
-                     '(default: 5000).'),
         'cluster_affinity': ('Subsampling with clustering of tree representation affinity when sample size is big '
                              '(default: True).'),
         'num_clstr': ('Number of clusters for clustering step '
                       '(default: 2000).'),
-        'num_sparse_partitions': ('Number of partitions for sparse outer product calculations. More is required for larger cluster size, but is slower. '
-                                  '(default: 500).'),
     },
     name='adaptive-visual',
     description='Computes haar-like-distance between samples using new'
