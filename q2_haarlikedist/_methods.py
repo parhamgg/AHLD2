@@ -537,7 +537,6 @@ def adaptive_visual(
     s: int = 5,  # Number of important nodes
     k: int = 5,
     n: int = 5,
-    lgbm: bool = False,
     cluster_affinity: bool = True,
     num_clstr: int = 2000
 ) -> None:

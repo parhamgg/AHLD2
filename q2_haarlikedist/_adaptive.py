@@ -6,11 +6,10 @@ import time
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-from itertools import chain
-from scipy.sparse import csr_matrix, csc_matrix, coo_matrix, vstack
+from scipy.sparse import csr_matrix, csc_matrix
 
 from sklearn.utils.extmath import randomized_svd
-from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn_extra.cluster import KMedoids
@@ -19,16 +18,14 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
 
 
-import lightgbm as lgb
-
 __all__ = [
     'calc_haar_mags',
     'get_otu_abundances',
     'preprocess',
     'proximity_matrix',
-    'spouter',
+    'mds_full_randomized',
     'convert_least_squares',
-    'matching_pursuit',
+    'matching_pursuit_lazy_parallel',
     'diag_impo',
     'adaptive',
     'reconstruct_coord',
@@ -40,7 +37,6 @@ __all__ = [
     'make_plots',
     'boxplot_plotter'
 ]
-# ADAPTIVE FNS -> What is this comment?
 
 
 def calc_haar_mags(haar_basis, abund_vec):
@@ -107,20 +103,15 @@ def preprocess(label, biom_table, haar_basis, metadata, tree):
     return X, Y, mags, dic
 
 
-def proximity_matrix(clf, X, lgbm):
+def proximity_matrix(clf, X):
     """ Generate random forest affinity matrix
     clf: a classifier (RandomForestClassifier)
     X : data matrix with dimensions n by m 
     lgbm: Model to use (true=LGBM/False)
     """
 
-    # terminals = index of the leaf in each decision tree that a sample
-    # (or samples) would land in. (nsamples x n estimators)
     print('proximity matrix:')
-    if lgbm:
-        terminals = clf.predict(X, pred_leaf=True, n_jobs=6)
-    else:
-        terminals = clf.apply(X)
+    terminals = clf.apply(X)
     print('tree leaves preds. shape', terminals.shape)
 
     nsamples, nTrees = terminals.shape
@@ -132,129 +123,10 @@ def proximity_matrix(clf, X, lgbm):
     return prox
 
 
-def spouter_partitioned(A, B, num_partitions=5000):
-    """ 
-    Efficient sparse outer product of two CSR matrices A and B (row-wise).
-    Each row's outer product is flattened into a 1D sparse vector.
-    """
-
-    N, L = A.shape
-    _, K = B.shape
-    row_splits = np.array_split(np.arange(N), num_partitions)
-    sparse_partitions = []
-
-    for row_indices in row_splits:
-        A_part = A[row_indices].astype(np.float32)
-        B_part = B[row_indices].astype(np.float32)
-
-        data = []
-        row_inds = []
-        col_inds = []
-
-        for row_idx, (a_row, b_row) in enumerate(zip(A_part, B_part)):
-            a_data = a_row.data
-            a_idx = a_row.indices
-            b_data = b_row.data
-            b_idx = b_row.indices
-
-            if len(a_data) == 0 or len(b_data) == 0:
-                continue
-
-            # Kronecker-style flattening for this row
-            vals = np.outer(a_data, b_data).ravel()
-            cols = np.add.outer(a_idx * K, b_idx).ravel()
-
-            row_inds.extend([row_idx] * len(vals))
-            col_inds.extend(cols)
-            data.extend(vals)
-
-        if len(data) > 0:
-            coo = coo_matrix((data, (row_inds, col_inds)), shape=(
-                len(row_indices), L * K), dtype=np.float32)
-            sparse_partitions.append(coo.tocsr())
-        else:
-            sparse_partitions.append(csr_matrix(
-                (len(row_indices), L * K), dtype=np.float32))
-
-    result = vstack(sparse_partitions)
-
-    print(
-        f"Type of result: {type(result)}, dtype: {result.dtype}, shape: {result.shape}")
-    return result
-
-
-def spouter(A, B):
-    """ Quickly compute sparse outer product
-    of two matrices. 
-
-    SOURCE:   https://stackoverflow.com/
-        questions/57099722/row-wise-outer-product-on-sparse-matrices """
-
-    N, L = A.shape
-    N, K = B.shape
-
-    drows = zip(*(np.split(x.data, x.indptr[1:-1]) for x in (A, B)))
-    data = [np.outer(a, b).ravel() for a, b in drows]
-    irows = zip(*(np.split(x.indices, x.indptr[1:-1]) for x in (A, B)))
-    indices = [
-        np.ravel_multi_index(np.ix_(a, b), (L, K)).ravel()
-        for a, b in irows
-    ]
-    indptr = np.fromiter(chain((0, ), map(len, indices)), int).cumsum()
-
-    return csr_matrix((np.concatenate(data), np.concatenate(indices), indptr),
-                      (N, L * K))
-
-
-def landmark_MDS(D, lands, dim):
-    """based on https://github.com/danilomotta/LMDSParameters:
-        D (ndarray): Full distance matrix of shape (n_samples, n_samples)
-        lands (list or array): Indices of landmark points
-        dim (int): Number of dimensions to project onto
-
-    Returns:
-        ndarray: Low-dimensional embedding of shape (n_samples, dim)
-    """
-    Dl = D[:, lands]  # shape: (n_samples, n_landmarks)
-    n, k = Dl.shape
-
-    # Double centering for non-square distance matrix
-    Dl2 = Dl ** 2
-    row_mean = np.mean(Dl2, axis=1, keepdims=True)     # shape (n, 1)
-    col_mean = np.mean(Dl2, axis=0, keepdims=True)     # shape (1, k)
-    total_mean = np.mean(Dl2)                          # scalar
-
-    B = -0.5 * (Dl2 - row_mean - col_mean + total_mean)  # shape (n, k)
-
-    # SVD decomposition
-    U, S, _ = np.linalg.svd(B, full_matrices=False)
-
-    # Keep only significantly positive singular values
-    pos = S > 1e-10  # Filter out numerical noise
-    num_pos = np.count_nonzero(pos)
-
-    if num_pos == 0:
-        print("Error: No positive singular values found.")
-        return np.empty((n, 0))  # Return empty array with correct shape
-
-    # Adjust `dim` to available singular values
-    dim = min(dim, num_pos)
-    print(f"Using {dim} dimensions out of {num_pos} available.")
-
-    # Use top-dim components
-    U = U[:, pos][:, :dim]  # Filter U for valid singular values
-    S = S[pos][:dim]        # Keep top singular values
-
-    # Compute embedding
-    X = U * np.sqrt(S)  # shape: (n, dim)
-
-    return X
-
-
 def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
     """
     Memory-efficient full MDS using randomized SVD.
-    
+
     Parameters
     ----------
     D : ndarray of shape (n_samples, n_samples)
@@ -367,12 +239,11 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
 def convert_least_squares(affinity, Y, clstr, num_clstr, size_embedding=50):
     print('convert least squares:')
     st = time.time()
-    
+
     print('doing randomized MDS')
     embedding = mds_full_randomized(affinity, size_embedding)
     affinity_transformed = csr_matrix(embedding)
     print(f'MDS time: {time.time() - st}')
-
 
     if clstr and affinity_transformed.shape[0] > num_clstr:
         print('clustering samples based on tree-leaf-predictions representation')
@@ -393,37 +264,10 @@ def convert_least_squares(affinity, Y, clstr, num_clstr, size_embedding=50):
         (sparsegram.shape[0]**2, 1), order='F'))
     signal = csc_matrix(signal)
 
-    ##### Normalizing signal #####
-    norm = np.sqrt(signal.power(2).sum())
-    if norm == 0:
-        raise ValueError("Cannot normalize a zero vector.")
-    signal = signal / norm
-
     print('signal created.')
     print('signal shape:', signal.shape)
 
     return signal, sparsegram, medoid_inds
-
-
-def matching_pursuit(signal, dictionary, s):
-
-    dictionarynorm = normalize(dictionary, norm='l2', axis=0)
-    coefs = []
-    indices = []
-    R = signal
-
-    for i in range(s):
-        innerprod = dictionarynorm.T@R
-
-        index = np.argmax((innerprod))
-        indices.append(index)
-
-        maxproj = innerprod[index].todense().item()
-
-        coefs.append(maxproj / np.linalg.norm(dictionary[:, index].toarray()))
-        R = R - maxproj*dictionarynorm[:, index]
-
-    return indices, coefs
 
 
 def _score_chunk_return_arrays(chunk_indices, sub_chunk, M, row_sq_norms):
@@ -488,10 +332,12 @@ def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
 
     # reshape signal -> residual matrix M (CSR)
     R_vec = signal.toarray().ravel()
-    M = csr_matrix(R_vec.reshape((n_samples, n_samples), order='F'), dtype=np.float64)
+    M = csr_matrix(R_vec.reshape(
+        (n_samples, n_samples), order='F'), dtype=np.float64)
 
     # precompute denom (||u||^2) exactly as serial
-    row_sq_norms = np.asarray(sub_mags.power(2).sum(axis=1)).reshape(-1).astype(np.float64)
+    row_sq_norms = np.asarray(sub_mags.power(2).sum(
+        axis=1)).reshape(-1).astype(np.float64)
 
     # chunking strategy (deterministic)
     if n_jobs is None:
@@ -510,7 +356,8 @@ def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
         for _ in range(s):
             # submit scoring jobs for each chunk
             futures = [
-                exc.submit(_score_chunk_return_arrays, chunks[i], sub_chunks[i], M, row_sq_norms)
+                exc.submit(_score_chunk_return_arrays,
+                           chunks[i], sub_chunks[i], M, row_sq_norms)
                 for i in range(len(chunks))
             ]
             # collect chunk outputs and assemble full arrays
@@ -549,7 +396,8 @@ def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
 
             # Update residual vector and M for next iteration
             R_vec = R_vec - (maxproj / atom_norm) * atom_vec
-            M = csr_matrix(R_vec.reshape((n_samples, n_samples), order='F'), dtype=np.float64)
+            M = csr_matrix(R_vec.reshape(
+                (n_samples, n_samples), order='F'), dtype=np.float64)
 
     return indices, coefs
 
@@ -585,58 +433,7 @@ def diag_impo(mags, coordinates, coefficients):
     return coefs
 
 
-def train_LGBM(X, Y):
-    # Convert Y to 1D if it's a single column DataFrame
-    Y_1d = Y.squeeze()
-    unique_labels = sorted(Y_1d.unique())
-    num_unique = len(unique_labels)
-
-    # Shift labels so smallest is 0 (LightGBM multiclass requires 0-based)
-    shift = unique_labels[0]
-    Y_1d_zero_based = Y_1d - shift
-
-    # Choose objective
-    if num_unique == 2:
-        objective = 'binary'
-        metric = 'binary_logloss'
-    else:
-        objective = 'multiclass'
-        metric = 'multi_logloss'
-
-    # Prepare LightGBM Datasets
-    train_data = lgb.Dataset(X, label=Y_1d_zero_based)
-
-    # LightGBM parameters for a fast model
-    params = {
-        'objective': objective,
-        'metric': metric,
-        'num_class': num_unique,
-        'learning_rate': 0.16819239188201524,
-        'num_leaves': 6,
-        'max_depth': 38,
-        'min_data_in_leaf': 1,  # equivalent to min_samples_leaf
-        'bagging_fraction': 0.8945334948696256,
-        'bagging_freq': 1,
-        'feature_fraction': 0.7271535699005337,
-        'verbose': -1
-    }
-
-    num_boost_round = 247
-
-    start_lgb = time.time()
-    bst = lgb.train(
-        params=params,
-        train_set=train_data,
-        num_boost_round=num_boost_round,
-    )
-    end_lgb = time.time()
-    lgb_time = end_lgb - start_lgb
-    print(f"LightGBM training time: {lgb_time:.2f} s")
-
-    return bst
-
-
-def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, cluster_affinity, num_clstr):
+def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num_clstr):
     """ shl: sparse haar like coordinates
         biom_table_data: biom_table, 
         label: str, column in meta to use 
@@ -648,22 +445,19 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, lgbm, cluster_affinit
     """
 
     # Control Vars. Maybe later add to func args?
-    print('running with lgbm=', lgbm, ' cluster_affinity=', cluster_affinity, sep='')
+    print('running with cluster_affinity=', cluster_affinity, sep='')
 
     X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
     print('preprocessing done.')
 
-    if lgbm:
-        clf = train_LGBM(X, Y)
-    else:
-        clf = RandomForestClassifier(n_estimators=500,
-                                     bootstrap=True,
-                                     min_samples_leaf=1,
-                                     n_jobs=-1)
-        clf.fit(X, Y)
+    clf = RandomForestClassifier(n_estimators=500,
+                                 bootstrap=True,
+                                 min_samples_leaf=1,
+                                 n_jobs=-1)
+    clf.fit(X, Y)
     print('RF training done.')
 
-    rfaffinity = proximity_matrix(clf, X, lgbm)
+    rfaffinity = proximity_matrix(clf, X)
     print('affinity generated.')
 
     signal, rfgram, medoid_indices = convert_least_squares(

@@ -97,7 +97,6 @@ plugin.visualizers.register_function(
         's': Int,
         'k': Int,
         'n': Int,
-        'lgbm': Bool,
         'cluster_affinity': Bool,
         'num_clstr': Int
     },
@@ -119,8 +118,6 @@ plugin.visualizers.register_function(
         's': ('Number of important nodes to find'),
         'k': ('for PCoA reconstruction'),  # TODO: update with more info
         'n': ('for PCoA reconstruction'),  # TODO: update with more info
-        'lgbm': ('Use LightGBM classifier for faster RF prediction '
-                 '(default: False).'),
         'cluster_affinity': ('Subsampling with clustering of tree representation affinity when sample size is big '
                              '(default: True).'),
         'num_clstr': ('Number of clusters for clustering step '
