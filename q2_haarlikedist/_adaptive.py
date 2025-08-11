@@ -708,11 +708,14 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 6))
 
     # Heatmap 1
-    axes[0].imshow(sorted_rfgram.todense(), vmin=0, vmax=.3, cmap='binary')
+    vmin, vmax = np.quantile(rfgram, [0.01, 0.99])
+    axes[0].imshow(sorted_rfgram.todense(), vmin=vmin,
+                   vmax=vmax, cmap='binary')
     axes[0].xaxis.set_visible(False)
 
     # Heatmap 2
-    axes[1].imshow(sorted_reconstructed, vmin=0, vmax=.3, cmap='binary')
+    vmin, vmax = np.quantile(sorted_reconstructed, [0.01, 0.99])
+    axes[1].imshow(sorted_reconstructed, vmin=vmin, vmax=vmax, cmap='binary')
     axes[1].xaxis.set_visible(False)
 
     # Create new axes below each heatmap for the group bars

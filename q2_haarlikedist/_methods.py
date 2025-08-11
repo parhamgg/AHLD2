@@ -551,7 +551,7 @@ def adaptive_visual(
     meta = metadata.to_dataframe()
 
     adhld_results = adaptive(haar_basis, biom_table, label,
-                             tree, meta, s, lgbm, cluster_affinity, num_clstr)
+                             tree, meta, s, cluster_affinity, num_clstr)
 
     _, _, coordinates, _, _, _, diagonal, mags = adhld_results
 
