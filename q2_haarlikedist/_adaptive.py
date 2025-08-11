@@ -468,6 +468,13 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
 
     mags = mags[:, medoid_indices]
 
+    # Drop synthetic “root-split” rows so rows map 1:1 to non-tips
+    nontips_count = sum(1 for _ in tree.postorder() if not _.is_tip())
+    if mags.shape[0] > nontips_count:
+        mags_core = mags[:nontips_count, :]
+    else:
+        mags_core = mags
+
     st = time.time()
     coordinates, coefs = matching_pursuit_lazy_parallel(signal, mags, s)
     print(coordinates)
