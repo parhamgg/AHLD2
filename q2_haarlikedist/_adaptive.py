@@ -171,69 +171,94 @@ def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
 
 def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, verbose=True):
     """
-    Hybrid medoid selection:
-    - Includes all points from small labels (≤ target_per_label)
-    - Uses KMedoids on larger labels to match target_total exactly
-    - Maintains original row order
+    Balanced medoid selection that always returns exactly target_total
+    (when target_total <= number of samples).
     """
-    labels = np.array(Y)
+    rng = np.random.RandomState(random_state)
+    labels = np.asarray(Y)
     unique_labels = np.unique(labels)
-    print('Y', labels)
-    print('unique', unique_labels)
-    label_to_indices = {label: np.where(labels == label)[
-        0] for label in unique_labels}
+    if verbose:
+        print('Y', labels)
+        print('unique', unique_labels)
+
+    # Group indices by label
+    label_to_indices = {lab: np.flatnonzero(
+        labels == lab) for lab in unique_labels}
     n_labels = len(unique_labels)
     target_per_label = target_total // n_labels
 
     selected_indices = []
-    large_labels = []
-    actual_total = 0
+    large = []   # entries: {'label', 'idxs', 'assign'}
 
-    # Step 1: Handle small labels
-    for label in unique_labels:
-        idxs = label_to_indices[label]
+    # Step 1: include all samples from small labels (<= target_per_label)
+    actual_total = 0
+    for lab in unique_labels:
+        idxs = label_to_indices[lab]
         if len(idxs) <= target_per_label:
             selected_indices.extend(idxs.tolist())
             actual_total += len(idxs)
         else:
-            large_labels.append((label, idxs))
+            large.append({'label': lab, 'idxs': idxs, 'assign': 0})
 
-    # Step 2: Distribute remaining medoids across larger labels
-    remaining_slots = target_total - actual_total
+    remaining = target_total - actual_total
     if verbose:
         print(f"Total from small labels: {actual_total}")
-        print(
-            f"Remaining slots: {remaining_slots} for {len(large_labels)} labels")
+        print(f"Remaining slots: {remaining} for {len(large)} labels")
 
-    if large_labels and remaining_slots > 0:
-        base_per_label = remaining_slots // len(large_labels)
-        extras = remaining_slots % len(large_labels)
+    # If small labels already exceed the budget, downsample them
+    if remaining < 0:
+        keep = target_total
+        selected_indices = rng.choice(
+            selected_indices, size=keep, replace=False).tolist()
+        remaining = 0
 
-        for i, (label, idxs) in enumerate(large_labels):
-            n_clusters = base_per_label + (1 if i < extras else 0)
-            n_clusters = min(n_clusters, len(idxs))  # safety check
+    # Step 2: allocate to large labels, honoring each label's capacity
+    if remaining > 0 and large:
+        base = remaining // len(large)
+        extras = remaining % len(large)
 
-            X_label = affinity[idxs]
+        # Initial allocation (equal share + extras), capped by label size
+        for i, L in enumerate(large):
+            cap = len(L['idxs'])
+            want = base + (1 if i < extras else 0)
+            L['assign'] = min(want, cap)
+
+        assigned = sum(L['assign'] for L in large)
+        leftover = remaining - assigned
+
+        # Redistribute any leftover to labels with remaining capacity
+        while leftover > 0:
+            progressed = False
+            for L in large:
+                cap = len(L['idxs'])
+                if L['assign'] < cap:
+                    L['assign'] += 1
+                    leftover -= 1
+                    progressed = True
+                    if leftover == 0:
+                        break
+            if not progressed:
+                # Not enough capacity anywhere: only possible if target_total > n_samples
+                break
+
+        # Finally pick medoids per large label
+        for L in large:
+            k = L['assign']
+            if k <= 0:
+                continue
+            X_label = affinity[L['idxs']]
             if hasattr(X_label, "toarray"):
                 X_label = X_label.toarray()
-
-            km = KMedoids(n_clusters=n_clusters,
-                          random_state=random_state).fit(X_label)
-            medoids = [idxs[j] for j in km.medoid_indices_]
-            selected_indices.extend(medoids)
+            km = KMedoids(n_clusters=k, random_state=random_state).fit(X_label)
+            selected_indices.extend(L['idxs'][km.medoid_indices_].tolist())
 
     if len(selected_indices) != target_total:
         raise ValueError(
             f"Expected {target_total} medoids but got {len(selected_indices)}.")
 
-    # Preserve order
-    ordered_indices = sorted(selected_indices)
-
-    if len(ordered_indices) != target_total:
-        raise ValueError(
-            "Mismatch after ordering — likely duplicate trimming removed too much.")
-
-    return np.array(ordered_indices)
+    # Preserve original order
+    ordered = np.sort(np.asarray(selected_indices))
+    return ordered
 
 
 def convert_least_squares(affinity, Y, clstr, num_clstr, size_embedding=50):
