@@ -471,9 +471,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
     # Drop synthetic “root-split” rows so rows map 1:1 to non-tips
     nontips_count = sum(1 for _ in tree.postorder() if not _.is_tip())
     if mags.shape[0] > nontips_count:
-        mags_core = mags[:nontips_count, :]
-    else:
-        mags_core = mags
+        mags = mags[:nontips_count, :]
 
     st = time.time()
     coordinates, coefs = matching_pursuit_lazy_parallel(signal, mags, s)
@@ -715,7 +713,7 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 6))
 
     # Heatmap 1
-    vmin, vmax = np.quantile(rfgram, [0.01, 0.99])
+    vmin, vmax = np.quantile(sorted_rfgram.data, [0.01, 0.99])
     axes[0].imshow(sorted_rfgram.todense(), vmin=vmin,
                    vmax=vmax, cmap='binary')
     axes[0].xaxis.set_visible(False)
