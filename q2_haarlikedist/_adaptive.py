@@ -170,92 +170,84 @@ def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
 
 
 def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, verbose=True):
-    """
-    Balanced medoid selection that always returns exactly target_total
-    (when target_total <= number of samples).
-    """
-    rng = np.random.RandomState(random_state)
     labels = np.asarray(Y)
     unique_labels = np.unique(labels)
+    n_samples = labels.shape[0]
+    if target_total > n_samples:
+        raise ValueError(
+            f"target_total ({target_total}) exceeds number of samples ({n_samples}).")
     if verbose:
         print('Y', labels)
         print('unique', unique_labels)
 
-    # Group indices by label
-    label_to_indices = {lab: np.flatnonzero(
-        labels == lab) for lab in unique_labels}
+    label_to_indices = {label: np.flatnonzero(
+        labels == label) for label in unique_labels}
     n_labels = len(unique_labels)
     target_per_label = target_total // n_labels
 
-    selected_indices = []
-    large = []   # entries: {'label', 'idxs', 'assign'}
+    assignment_dict = {label: (len(label_to_indices[label]), min(
+        len(label_to_indices[label]), target_per_label)) for label in unique_labels}  # {label: (available, assigned)}
+    print(assignment_dict)
 
-    # Step 1: include all samples from small labels (<= target_per_label)
-    actual_total = 0
-    for lab in unique_labels:
-        idxs = label_to_indices[lab]
-        if len(idxs) <= target_per_label:
-            selected_indices.extend(idxs.tolist())
-            actual_total += len(idxs)
-        else:
-            large.append({'label': lab, 'idxs': idxs, 'assign': 0})
+    small_labels = set()
 
-    remaining = target_total - actual_total
+    def update_small_labels():
+        nonlocal small_labels
+        for label, tupl in assignment_dict.items():
+            if tupl[0] == tupl[1]:
+                small_labels.add(label)
+    update_small_labels()
+
+    total_assigned = 0
+
+    def update_assigned():
+        nonlocal total_assigned
+        total_assigned = sum([_[1] for _ in assignment_dict.values()])
+    update_assigned()
+
+    while total_assigned < target_total:
+        available_labels = set(
+            [_ for _ in unique_labels if _ not in small_labels])
+        remaining_per_label = (
+            target_total - total_assigned) // (len(available_labels))
+        for label in available_labels:
+            assert label in assignment_dict
+            label_avail, label_assigned = assignment_dict[label]
+            assignment_dict[label] = (label_avail, min(
+                label_avail, label_assigned + remaining_per_label))
+
+        previously_assigned = total_assigned
+        update_assigned()
+        if previously_assigned == total_assigned:
+            raise ValueError(
+                '[select_hybrid_balanced_medoids] Critical error: not updating assignments')
+        update_small_labels()
+
     if verbose:
-        print(f"Total from small labels: {actual_total}")
-        print(f"Remaining slots: {remaining} for {len(large)} labels")
+        print('assignments:\n', assignment_dict)
 
-    # If small labels already exceed the budget, downsample them
-    if remaining < 0:
-        keep = target_total
-        selected_indices = rng.choice(
-            selected_indices, size=keep, replace=False).tolist()
-        remaining = 0
+    # Now selecting indices
+    selected_indices = []
+    for label in small_labels:
+        assert label in label_to_indices
+        assert label in assignment_dict
+        assert assignment_dict[label][0] == assignment_dict[label][1]
+        selected_indices.extend(label_to_indices[label].tolist())
 
-    # Step 2: allocate to large labels, honoring each label's capacity
-    if remaining > 0 and large:
-        base = remaining // len(large)
-        extras = remaining % len(large)
+    remaining_labels = set([_ for _ in unique_labels if _ not in small_labels])
+    for label in remaining_labels:
+        assert label in label_to_indices
+        assert label in assignment_dict
+        assert assignment_dict[label][0] > assignment_dict[label][1]
+        X_label = affinity[label_to_indices[label]]
+        final_assigned = assignment_dict[label][1]
+        km = KMedoids(n_clusters=final_assigned,
+                      random_state=random_state).fit(X_label)
+        selected_indices.extend(
+            label_to_indices[label][km.medoid_indices_].tolist())
 
-        # Initial allocation (equal share + extras), capped by label size
-        for i, L in enumerate(large):
-            cap = len(L['idxs'])
-            want = base + (1 if i < extras else 0)
-            L['assign'] = min(want, cap)
-
-        assigned = sum(L['assign'] for L in large)
-        leftover = remaining - assigned
-
-        # Redistribute any leftover to labels with remaining capacity
-        while leftover > 0:
-            progressed = False
-            for L in large:
-                cap = len(L['idxs'])
-                if L['assign'] < cap:
-                    L['assign'] += 1
-                    leftover -= 1
-                    progressed = True
-                    if leftover == 0:
-                        break
-            if not progressed:
-                # Not enough capacity anywhere: only possible if target_total > n_samples
-                break
-
-        # Finally pick medoids per large label
-        for L in large:
-            k = L['assign']
-            if k <= 0:
-                continue
-            X_label = affinity[L['idxs']]
-            if hasattr(X_label, "toarray"):
-                X_label = X_label.toarray()
-            km = KMedoids(n_clusters=k, random_state=random_state).fit(X_label)
-            selected_indices.extend(L['idxs'][km.medoid_indices_].tolist())
-
-    if len(selected_indices) != target_total:
-        raise ValueError(
-            f"Expected {target_total} medoids but got {len(selected_indices)}.")
-
+    if verbose:
+        print('\n~#$   Medoids   $#~:\n', selected_indices)
     # Preserve original order
     ordered = np.sort(np.asarray(selected_indices))
     return ordered
@@ -406,7 +398,6 @@ def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
             if not np.isfinite(best_score) or best_score == -np.inf:
                 break
 
-            best_num = float(nums_full[best_idx])
             best_denom = float(denoms_full[best_idx])
 
             # reconstruct the chosen atom and update residual exactly as serial
