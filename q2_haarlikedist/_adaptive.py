@@ -205,11 +205,17 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
         total_assigned = sum([_[1] for _ in assignment_dict.values()])
     update_assigned()
 
+    increment = False
     while total_assigned < target_total:
         available_labels = set(
             [_ for _ in unique_labels if _ not in small_labels])
         remaining_per_label = (
             target_total - total_assigned) // (len(available_labels))
+
+        if remaining_per_label == 0:
+            increment = True
+            break
+
         for label in available_labels:
             assert label in assignment_dict
             label_avail, label_assigned = assignment_dict[label]
@@ -222,6 +228,15 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
             raise ValueError(
                 '[select_hybrid_balanced_medoids] Critical error: not updating assignments')
         update_small_labels()
+
+    if increment:
+        for label in available_labels:
+            assert label in assignment_dict
+            assignment_dict[label] = (
+                assignment_dict[label][0], assignment_dict[label][1] + 1)
+            update_assigned()
+            if total_assigned == target_total:
+                break
 
     if verbose:
         print('assignments:\n', assignment_dict)
