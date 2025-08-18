@@ -3,16 +3,21 @@ import pandas as pd
 import os
 import time
 
+import optuna
+
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from scipy.sparse import csr_matrix, csc_matrix
 
 from sklearn.utils.extmath import randomized_svd
+from sklearn.utils import check_random_state
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn_extra.cluster import KMedoids
+
+from numpy.typing import DTypeLike
 
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
@@ -123,6 +128,59 @@ def proximity_matrix(clf, X):
     return prox
 
 
+# ---------- parallel proximity (tree-wise) ----------
+def _prox_sum_for_tree_column(col: np.ndarray, dtype: DTypeLike = np.float32):
+    """Return the nxn coincidence matrix for one tree (float32)."""
+    # equality outer product -> 1 if same leaf, else 0
+    eq = (col[:, None] == col[None, :])
+    # cast once; returning ndarray to be summed by caller
+    return eq.astype(dtype, copy=False)
+
+
+def proximity_from_leaves_parallel(terminals: np.ndarray,
+                                   n_jobs: int = None,
+                                   return_distance: bool = True,
+                                   dtype=np.float32):
+    """
+    terminals: (n_samples, n_trees) leaf indices from RF.apply(X)
+    Parallelizes across trees; returns:
+      - distance matrix D = 1 - proximity if return_distance=True
+      - otherwise the proximity matrix in [0,1].
+    """
+    n, T = terminals.shape
+    if n_jobs is None:
+        n_jobs = min(cpu_count(), T)
+
+    # chunk trees into roughly equal parts for threads
+    splits = np.array_split(np.arange(T), n_jobs)
+    prox_parts = [None] * len(splits)
+
+    def worker(chunk_idx):
+        cols = splits[chunk_idx]
+        if len(cols) == 0:
+            return np.zeros((n, n), dtype=dtype)
+        acc = np.zeros((n, n), dtype=dtype)
+        # accumulate chunk's trees
+        for t in cols:
+            acc += _prox_sum_for_tree_column(terminals[:, t], dtype=dtype)
+        return acc
+
+    with ThreadPoolExecutor(max_workers=len(splits)) as ex:
+        futures = {ex.submit(worker, i): i for i in range(len(splits))}
+        for fut in futures:
+            idx = futures[fut]
+            prox_parts[idx] = fut.result()
+
+    prox = np.zeros((n, n), dtype=dtype)
+    for part in prox_parts:
+        prox += part
+
+    prox /= terminals.shape[1]  # normalize by #trees
+    if return_distance:
+        return (1.0 - prox).astype(dtype, copy=False)
+    return prox
+
+
 def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
     """
     Memory-efficient full MDS using randomized SVD.
@@ -167,6 +225,212 @@ def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
     X = U * np.sqrt(S)
 
     return X
+
+
+def center_gram(K: np.ndarray) -> np.ndarray:
+    if not isinstance(K, np.ndarray):
+        K = K.toarray()
+
+    """Double-center a Gram/similarity matrix K."""
+    row_mean = K.mean(axis=1, keepdims=True)
+    col_mean = K.mean(axis=0, keepdims=True)
+    total_mean = K.mean()
+    return K - row_mean - col_mean + total_mean
+
+
+def make_label_kernel(y: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Construct the ideal label kernel L_ij = 1[y_i == y_j],
+    center it, and return (L_c, ||L_c||_F).
+    """
+    _, inv = np.unique(y, return_inverse=True)
+    L = (inv[:, None] == inv[None, :]).astype(np.float64)
+    Lc = center_gram(L)
+    Lc_norm = np.linalg.norm(Lc)
+    return Lc, Lc_norm
+
+
+def kta_score(K: np.ndarray, Lc: np.ndarray, Lc_norm: float) -> float:
+    """
+    1 - centered kernel target alignment between K and the label kernel.
+    Lower is better, 0 is perfect alignment, 1 is poor alignment.
+    """
+    Kc = center_gram(K)
+    num = np.sum(Kc * Lc)
+    denom = (np.linalg.norm(Kc) * Lc_norm) + 1e-12
+    alignment = num / denom
+    return 1.0 - alignment
+
+
+# ---------- sparsegram builders ----------
+def compute_mds_embedding_from_distance(D: np.ndarray,
+                                        size_embedding: int = 50,
+                                        random_state=None):
+    return mds_full_randomized(D, dim=size_embedding, random_state=random_state)
+
+
+def build_sparsegram_from_embedding(embedding: np.ndarray):
+    # K = X X^T ; return as float32 to save RAM
+    X = np.asarray(embedding, dtype=np.float32)
+    return X @ X.T
+
+
+# ---------- stratified subsample ----------
+def stratified_cap_indices(y: np.ndarray, cap: int, rng=None):
+    """
+    Balanced subsample across classes (without replacement).
+    Returns sorted indices into original array.
+    """
+    rng = check_random_state(rng)
+    y = np.asarray(y)
+    classes, counts = np.unique(y, return_counts=True)
+    # allocate roughly proportional, at least 1 per class
+    weights = counts / counts.sum()
+    take = np.maximum(1, np.floor(weights * cap).astype(int))
+    # make sure we hit the cap exactly
+    while take.sum() < min(cap, len(y)):
+        # add one to the class with largest fractional remainder
+        remainders = weights * cap - np.floor(weights * cap)
+        j = np.argmax(remainders)
+        take[j] += 1
+    # sample
+    idxs = []
+    for c, k in zip(classes, take):
+        cand = np.where(y == c)[0]
+        if k >= len(cand):
+            idxs.extend(cand.tolist())
+        else:
+            idxs.extend(rng.choice(cand, size=int(k), replace=False).tolist())
+    return np.array(sorted(idxs), dtype=int)
+
+# ---------- main objective used by Optuna ----------
+
+
+def rf_kta_objective_sklearn(trial,
+                             X: np.ndarray,
+                             y: np.ndarray,
+                             *,
+                             subsample_cap: int = 6000,
+                             mds_dim: int = 50,
+                             n_jobs_prox: int = None,
+                             random_state: int = 42):
+    """
+    Optuna objective: fit RF on a stratified subsample, build RF distance,
+    do randomized-MDS -> sparsegram, compute KTA loss.
+    Minimize KTA loss (0 is perfect).
+    """
+
+    # --- subsample (stratified) for speed ---
+    idx = stratified_cap_indices(y, cap=min(subsample_cap, len(y)),
+                                 rng=random_state)
+    Xs = X[idx]
+    ys = y[idx]
+
+    # --- search space (keeping it narrow for speed/robustness) ---
+    n_estimators = trial.suggest_int("n_estimators", 120, 400)
+    max_depth = trial.suggest_int("max_depth", 12, 40)
+    min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 4)
+    # mix of categorical + numeric options keeps trees cheap on 175k features
+    max_features_choice = trial.suggest_categorical(
+        "max_features_choice", ["sqrt", "log2", 0.05, 0.1, 0.2, 0.4, 0.8]
+    )
+    if isinstance(max_features_choice, float):
+        max_features = max_features_choice
+    else:
+        max_features = max_features_choice
+
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        bootstrap=True,
+        oob_score=True,   # we’ll use this for lightweight pruning
+        n_jobs=-1,
+        random_state=random_state,
+        warm_start=False
+    )
+
+    t0 = time.time()
+    rf.fit(Xs, ys)
+    t_fit = time.time() - t0
+
+    # lightweight pruning: if oob accuracy is really bad, prune
+    if rf.oob_score_ is not None:
+        # higher oob -> lower loss; report an intermediate value
+        trial.report(1.0 - float(rf.oob_score_), step=0)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    # leaves -> RF distance (parallel over trees)
+    t1 = time.time()
+    leaves = rf.apply(Xs)  # (n_sub, n_trees)
+    D = proximity_from_leaves_parallel(leaves,
+                                       n_jobs=n_jobs_prox,
+                                       return_distance=True,
+                                       dtype=np.float32)
+    t_prox = time.time() - t1
+
+    # randomized MDS -> sparsegram
+    t2 = time.time()
+    emb = compute_mds_embedding_from_distance(D, size_embedding=mds_dim,
+                                              random_state=random_state)
+    K = build_sparsegram_from_embedding(emb)  # float32
+    t_mds = time.time() - t2
+
+    # KTA loss
+    Lc, Lc_norm = make_label_kernel(ys)
+    loss = kta_score(K, Lc, Lc_norm)
+
+    # record component times for your logs
+    trial.set_user_attr("t_fit", t_fit)
+    trial.set_user_attr("t_prox", t_prox)
+    trial.set_user_attr("t_mds", t_mds)
+    return float(loss)
+
+
+def tune_rf_params_sklearn(X: np.ndarray,
+                           y: np.ndarray,
+                           *,
+                           n_trials: int = 25,
+                           subsample_cap: int = 6000,
+                           mds_dim: int = 50,
+                           random_state: int = 42,
+                           n_jobs_prox: int = None,
+                           study_name: str = "RF-KTA-Tuning"):
+    """
+    Run Optuna on the KTA objective above. Returns (best_params, study).
+    """
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
+    sampler = optuna.samplers.TPESampler(seed=random_state, n_startup_trials=5)
+
+    def _obj(trial):
+        return rf_kta_objective_sklearn(
+            trial, X, y,
+            subsample_cap=subsample_cap,
+            mds_dim=mds_dim,
+            n_jobs_prox=n_jobs_prox,
+            random_state=random_state
+        )
+
+    study = optuna.create_study(direction="minimize",
+                                pruner=pruner,
+                                sampler=sampler,
+                                study_name=study_name)
+    study.optimize(_obj, n_trials=n_trials, show_progress_bar=False)
+
+    # build params dict for sklearn RF
+    p = study.best_trial.params
+    best_params = dict(
+        n_estimators=int(p["n_estimators"]),
+        max_depth=int(p["max_depth"]),
+        min_samples_leaf=int(p["min_samples_leaf"]),
+        max_features=p["max_features_choice"],  # may be 'sqrt'/'log2'/float
+        bootstrap=True,
+        n_jobs=-1,
+        random_state=random_state
+    )
+    return best_params, study
 
 
 def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, verbose=True):
@@ -475,16 +739,37 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
         returns dic, rfgram, coordinates, coefs, Y, dic, new_diag
     """
 
-    # Control Vars. Maybe later add to func args?
+    # Control Vars
     print('running with cluster_affinity=', cluster_affinity, sep='')
 
     X, Y, mags, dic = preprocess(label, biom_table, haar_basis, meta, tree)
     print('preprocessing done.')
 
-    clf = RandomForestClassifier(n_estimators=500,
-                                 bootstrap=True,
-                                 min_samples_leaf=1,
-                                 n_jobs=-1)
+    # Tune RF hyperparams fast on a stratified subset - 25 trials
+    st = time.time()
+    print('tuning RF hyperparams...')
+    best_params, study = tune_rf_params_sklearn(
+        X, np.asarray(Y),
+        n_trials=25,
+        subsample_cap=min(num_clstr, len(Y)),
+        mds_dim=50,
+        random_state=42,
+        n_jobs_prox=None
+    )
+    print(f'tuning done in {time.time() - st} seconds. Best study:',
+          study.best_trial, 'Best params:', best_params, sep='\n')
+    avg_fit = np.mean([t.user_attrs["t_fit"]
+                      for t in study.trials if t.value is not None])
+    avg_prox = np.mean([t.user_attrs["t_prox"]
+                       for t in study.trials if t.value is not None])
+    avg_mds = np.mean([t.user_attrs["t_mds"]
+                      for t in study.trials if t.value is not None])
+    print(
+        f"Avg per-trial: fit={avg_fit:.2f}s, prox={avg_prox:.2f}s, mds={avg_mds:.2f}s")
+    print(
+        f"Estimated 25-trial wall-time: {(25*(avg_fit+avg_prox+avg_mds))/60:.1f} minutes")
+
+    clf = RandomForestClassifier(**best_params)
     clf.fit(X, Y)
     print('RF training done.')
 
