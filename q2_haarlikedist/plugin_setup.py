@@ -98,7 +98,8 @@ plugin.visualizers.register_function(
         'k': Int,
         'n': Int,
         'cluster_affinity': Bool,
-        'num_clstr': Int
+        'num_clstr': Int,
+        'tune': Bool
     },
     input_descriptions={
         'tree': (
@@ -122,6 +123,7 @@ plugin.visualizers.register_function(
                              '(default: True).'),
         'num_clstr': ('Number of clusters for clustering step '
                       '(default: 2000).'),
+        'tune': ('Tune RF hyperparameters - slows down the pipeline (default: False)'),
     },
     name='adaptive-visual',
     description='Computes haar-like-distance between samples using new'

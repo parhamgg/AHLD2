@@ -10,12 +10,12 @@ from collections import defaultdict
 import skbio
 import qiime2
 import biom
-import scipy
 import numpy as np
 import pandas as pd
 import os
 import hashlib
 import time
+import pickle
 
 from skbio import read
 from skbio.tree import TreeNode
@@ -25,12 +25,12 @@ from skbio.stats.ordination import pcoa
 
 from scipy.sparse import csr_matrix, lil_matrix, save_npz, load_npz
 
+from sklearn.metrics import silhouette_samples
 
 import q2templates
 from qiime2 import Metadata
 
 from pkg_resources import resource_filename
-
 
 from ._adaptive import *
 
@@ -503,6 +503,143 @@ def save_species(species, output_dir):
     return s
 
 
+def _save_silhouettes(output_dir: str, D_sparse, y_series: pd.Series, variable: str):
+    """
+    Compute per-sample silhouette scores from a *precomputed* distance matrix
+    and save them to <output_dir>/silhouttes.pickle.
+
+    Parameters
+    ----------
+    output_dir : str
+        Folder for this variable's outputs.
+    D_sparse : scipy.sparse matrix (nsamples x nsamples)
+        Haar-like *distance* matrix (symmetric, zero diagonal).
+    y_series : pd.Series
+        Labels for the samples in the same order as D_sparse.
+    variable : str
+        Variable name (label) for bookkeeping.
+    """
+    y = np.asarray(list(y_series))
+    classes, counts = np.unique(y, return_counts=True)
+
+    payload = {
+        'variable': variable,
+        'classes': classes.tolist(),
+        'class_counts': counts.tolist(),
+        'scores': None,
+        'mean': np.nan,
+        'metric': 'precomputed',
+        'note': ''
+    }
+
+    # Silhouette requires at least two classes with at least 2 samples each
+    if len(classes) < 2 or np.any(counts < 2):
+        payload['note'] = 'insufficient class structure for silhouette'
+        with open(os.path.join(output_dir, 'silhouttes.pickle'), 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+
+    # sklearn expects dense for metric='precomputed'
+    D = np.asarray(D_sparse.todense())
+    np.fill_diagonal(D, 0.0)
+
+    scores = silhouette_samples(D, y, metric='precomputed')
+    payload['scores'] = scores.astype(np.float32)
+    payload['mean'] = float(np.nanmean(scores))
+
+    with open(os.path.join(output_dir, 'silhouttes.pickle'), 'wb') as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _save_tax_heatmap_info(label: str,
+                           output_dir: str,
+                           tree: skbio.TreeNode,
+                           coordinates: list[int],
+                           species_dict: dict):
+    """
+    Collects per-coordinate details needed for the three stacked taxonomic
+    heatmaps and saves them to <output_dir>/heatmap_info.pickle.
+
+    Stores *per-coordinate* metrics; final averaging/aggregation happens
+    in the external 'create_tax_heatmap.py' script.
+
+    Saved keys:
+      - variable
+      - max_root_distance
+      - per_coord: list of dicts with
+          {coord_index, node_label, lca, dist_to_root, nonoverlap_species_count,
+           species_left, species_right}
+    """
+    # ---------- helpers ----------
+    def _dist_to_root(n: skbio.TreeNode) -> float:
+        d = 0.0
+        cur = n
+        while cur is not None:
+            if getattr(cur, 'length', None):
+                d += float(cur.length)
+            cur = cur.parent
+        return d
+
+    def _species_set_from_taxa_strings(taxa_strings):
+        """Extract only species-level names (after 's__'), drop empties."""
+        spp = set()
+        for t in taxa_strings:
+            if not isinstance(t, str):
+                continue
+            parts = [p.strip() for p in t.split(';')]
+            s_parts = [p for p in parts if p.startswith('s__')]
+            if not s_parts:
+                continue
+            s_val = s_parts[-1][3:].strip()  # after 's__'
+            if s_val:
+                spp.add(s_val)
+        return spp
+
+    # Map coordinates -> actual nodes in the current tree
+    nontips = [x for x in tree.postorder() if not x.is_tip()]
+    max_root_distance = max((_dist_to_root(n)
+                            for n in tree.postorder(include_self=True)), default=0.0)
+
+    per_coord = []
+    for i, c in enumerate(coordinates):
+        node = nontips[c]
+        node_label = getattr(node, 'name', str(c))
+
+        # LCA text (already computed in annotate_tree via find_common_clade)
+        lca_text = None
+        if isinstance(node_label, str) and ':' in node_label:
+            # annotate_tree set names like "<postorder>: <clade path>"
+            lca_text = node_label.split(':', 1)[1].strip()
+
+        # Pull left/right taxa sets from 'species_dict' (already computed)
+        keyname = f'coord {i}: {node_label}'
+        left_taxa = species_dict.get(keyname, {}).get('left', set())
+        right_taxa = species_dict.get(keyname, {}).get('right', set())
+
+        left_spp = _species_set_from_taxa_strings(left_taxa)
+        right_spp = _species_set_from_taxa_strings(right_taxa)
+        nonoverlap = len(left_spp.symmetric_difference(right_spp))
+
+        per_coord.append({
+            'coord_index': int(c),
+            'node_label': node_label,
+            'lca': lca_text,
+            'dist_to_root': float(_dist_to_root(node)),
+            'nonoverlap_species_count': int(nonoverlap),
+            'species_left': sorted(left_spp),
+            'species_right': sorted(right_spp),
+        })
+
+    payload = {
+        'variable': label,
+        'max_root_distance': float(max_root_distance),
+        'per_coord': per_coord,
+    }
+
+    with open(os.path.join(output_dir, 'heatmap_info.pickle'), 'wb') as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def haar_like_dist(table: biom.Table,
                    tree: skbio.TreeNode) \
     -> (DistanceMatrix, skbio.TreeNode,
@@ -538,7 +675,8 @@ def adaptive_visual(
     k: int = 5,
     n: int = 5,
     cluster_affinity: bool = True,
-    num_clstr: int = 2000
+    num_clstr: int = 2000,
+    tune: bool = False
 ) -> None:
 
     starttime = time.time()
@@ -551,21 +689,30 @@ def adaptive_visual(
     meta = metadata.to_dataframe()
 
     adhld_results = adaptive(haar_basis, biom_table, label,
-                             tree, meta, s, cluster_affinity, num_clstr)
+                             tree, meta, s, cluster_affinity, num_clstr, tune)
 
-    _, _, coordinates, _, _, _, diagonal, mags = adhld_results
+    _, _, coordinates, _, Y, _, diagonal, mags = adhld_results
 
-    _, modmags = compute_haar_dist(mags, diagonal)
+    Distances, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
 
-    make_plots(adhld_results, modmags, output_dir, s, k, n)
+    # Save silhouettes for this variable (radar plot source)
+    _save_silhouettes(output_dir, Distances, Y, label)
 
     # Get context to send to HTML file
+    annotated_tree = tree
     if taxonomy:
         annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
         species = get_species(annotated_tree, coordinates, taxonomy)
+
+        # heatmap info (per-coordinate detail saved; aggregation happens later)
+        _save_tax_heatmap_info(
+            label, output_dir, annotated_tree, coordinates, taxonomy, species)
     else:
         species = {'coord 1': 'No taxonomy provided'}
+
+    make_plots(adhld_results, modmags, output_dir, s, k, n,
+               tree=annotated_tree, tax_map=species)
 
     s = save_species(species, output_dir)
     coords = ' '.join([str(x) for x in coordinates])

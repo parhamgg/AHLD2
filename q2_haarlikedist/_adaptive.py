@@ -1,26 +1,28 @@
+from multiprocessing import cpu_count
+from concurrent.futures import ThreadPoolExecutor
+from numpy.typing import DTypeLike
+from sklearn_extra.cluster import KMedoids
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import check_random_state
+from sklearn.utils.extmath import randomized_svd
+from scipy.sparse import csr_matrix, csc_matrix
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import matplotlib
+import optuna
+import time
 import numpy as np
 import pandas as pd
+
+# --- headless rendering: must come before any matplotlib/ete3 import ---
 import os
-import time
+os.environ.setdefault('MPLBACKEND', 'Agg')          # Matplotlib: no GUI
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')  # Qt: no X server
 
-import optuna
 
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
-from scipy.sparse import csr_matrix, csc_matrix
-
-from sklearn.utils.extmath import randomized_svd
-from sklearn.utils import check_random_state
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
-from sklearn_extra.cluster import KMedoids
-
-from numpy.typing import DTypeLike
-
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import cpu_count
+matplotlib.use('Agg', force=True)
 
 
 __all__ = [
@@ -728,7 +730,7 @@ def diag_impo(mags, coordinates, coefficients):
     return coefs
 
 
-def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num_clstr):
+def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num_clstr, tune):
     """ shl: sparse haar like coordinates
         biom_table_data: biom_table, 
         label: str, column in meta to use 
@@ -746,31 +748,37 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
     print('preprocessing done.')
 
     # Tune RF hyperparams fast on a stratified subset - 25 trials
-    st = time.time()
-    print('tuning RF hyperparams...')
-    best_params, study = tune_rf_params_sklearn(
-        X, np.asarray(Y),
-        n_trials=25,
-        subsample_cap=min(num_clstr, len(Y)),
-        mds_dim=50,
-        random_state=42,
-        n_jobs_prox=None
-    )
-    print(f'tuning done in {time.time() - st} seconds. Best study:',
-          study.best_trial, 'Best params:', best_params, sep='\n')
-    avg_fit = np.mean([t.user_attrs["t_fit"]
-                      for t in study.trials if t.value is not None])
-    avg_prox = np.mean([t.user_attrs["t_prox"]
-                       for t in study.trials if t.value is not None])
-    avg_mds = np.mean([t.user_attrs["t_mds"]
-                      for t in study.trials if t.value is not None])
-    print(
-        f"Avg per-trial: fit={avg_fit:.2f}s, prox={avg_prox:.2f}s, mds={avg_mds:.2f}s")
-    print(
-        f"Estimated 25-trial wall-time: {(25*(avg_fit+avg_prox+avg_mds))/60:.1f} minutes")
+    if tune:
+        st = time.time()
+        print('tuning RF hyperparams...')
+        best_params, study = tune_rf_params_sklearn(
+            X, np.asarray(Y),
+            n_trials=25,
+            subsample_cap=min(num_clstr, len(Y)),
+            mds_dim=50,
+            random_state=42,
+            n_jobs_prox=None
+        )
+        print(f'tuning done in {time.time() - st} seconds. Best study:',
+              study.best_trial, 'Best params:', best_params, sep='\n')
+        avg_fit = np.mean([t.user_attrs["t_fit"]
+                           for t in study.trials if t.value is not None])
+        avg_prox = np.mean([t.user_attrs["t_prox"]
+                            for t in study.trials if t.value is not None])
+        avg_mds = np.mean([t.user_attrs["t_mds"]
+                           for t in study.trials if t.value is not None])
+        print(
+            f"Avg per-trial: fit={avg_fit:.2f}s, prox={avg_prox:.2f}s, mds={avg_mds:.2f}s")
+        print(
+            f"Estimated 25-trial wall-time: {(25*(avg_fit+avg_prox+avg_mds))/60:.1f} minutes")
 
-    clf = RandomForestClassifier(**best_params)
-    clf.fit(X, Y)
+        clf = RandomForestClassifier(**best_params)
+        clf.fit(X, Y)
+    else:
+        clf = RandomForestClassifier(n_estimators=500,
+                                     bootstrap=True,
+                                     min_samples_leaf=1)
+        clf.fit(X, Y)
     print('RF training done.')
 
     rfaffinity = proximity_matrix(clf, X)
