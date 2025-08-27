@@ -386,7 +386,7 @@ def get_taxa(node_name_list, taxonomy, make_set=True):
     for name in node_name_list:
         try:
             t = taxonomy[name]
-        except:
+        except KeyError:
             t = 'not found'
         taxa.append(t)
 
@@ -397,32 +397,23 @@ def get_taxa(node_name_list, taxonomy, make_set=True):
 
 
 def get_important_taxa(tree, idx, taxonomy):
-
-    nontips = [x for x in tree.postorder() if not x.is_tip()]
+    nontips = list(tree.non_tips(include_self=True))
     node = nontips[idx]
     l = left_children(node)
     r = right_children(node)
-
     l_taxa = get_taxa(l, taxonomy)
     r_taxa = get_taxa(r, taxonomy)
-
     return l_taxa, r_taxa
 
 
 def get_species(tree, coords, taxonomy):
-    """ Returns a dictionary of dictionaries with node,
-        left, right as keys each containing list of
-        tip species. Inputs: tree, coordinates. """
-
     species = defaultdict(dict)
-
-    nontips = [x for x in tree.postorder() if not x.is_tip()]
+    nontips = list(tree.non_tips(include_self=True))
     for i, c in enumerate(coords):
         l, r = get_important_taxa(tree, c, taxonomy)
         label = f'{nontips[c].name}'
         keyname = f'coord {i}: {label}'
         species[keyname]['left'], species[keyname]['right'] = l, r
-
     return species
 
 

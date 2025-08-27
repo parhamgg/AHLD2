@@ -29,7 +29,7 @@ __all__ = [
     'calc_haar_mags',
     'get_otu_abundances',
     'preprocess',
-    'proximity_matrix',
+    'proximity_from_leaves_parallel',
     'mds_full_randomized',
     'convert_least_squares',
     'matching_pursuit_lazy_parallel',
@@ -108,26 +108,6 @@ def preprocess(label, biom_table, haar_basis, metadata, tree):
     X = np.array(X)
 
     return X, Y, mags, dic
-
-
-def proximity_matrix(clf, X):
-    """ Generate random forest affinity matrix
-    clf: a classifier (RandomForestClassifier)
-    X : data matrix with dimensions n by m 
-    lgbm: Model to use (true=LGBM/False)
-    """
-
-    print('proximity matrix:')
-    terminals = clf.apply(X)
-    print('tree leaves preds. shape', terminals.shape)
-
-    nsamples, nTrees = terminals.shape
-    prox = np.zeros((nsamples, nsamples))
-    for i in range(nTrees):
-        a = terminals[:, i]
-        prox += 1*np.equal.outer(a, a)
-    prox = 1 - (prox / nTrees)
-    return prox
 
 
 # ---------- parallel proximity (tree-wise) ----------
@@ -538,18 +518,18 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
     return ordered
 
 
-def convert_least_squares(affinity, Y, clstr, num_clstr, size_embedding=50):
+def convert_least_squares(distance, Y, clstr, num_clstr, size_embedding=50):
     print('convert least squares:')
     st = time.time()
 
     print('doing randomized MDS')
-    embedding = mds_full_randomized(affinity, size_embedding)
+    embedding = mds_full_randomized(distance, size_embedding)
     affinity_transformed = csr_matrix(embedding)
     print(f'MDS time: {time.time() - st}')
 
     if clstr and affinity_transformed.shape[0] > num_clstr:
         print('clustering samples based on tree-leaf-predictions representation')
-        medoid_inds = select_hybrid_balanced_medoids(affinity, Y, num_clstr)
+        medoid_inds = select_hybrid_balanced_medoids(distance, Y, num_clstr)
         affinity_transformed = affinity_transformed[medoid_inds]
         print('medoid inds shape:', medoid_inds.shape)
         print('affinity shape:', end=' ')
@@ -716,7 +696,7 @@ def diag_impo(mags, coordinates, coefficients):
         coefs
     """
 
-    assigned = []
+    assigned = set()
     coefs = np.zeros(mags.shape[0])
 
     for i in range(len(coordinates)):
@@ -728,7 +708,7 @@ def diag_impo(mags, coordinates, coefficients):
                 f"Warning: suspiciously large coefficient {coef} at coord {coord}")
 
         if not coord in assigned:
-
+            assigned.add(coord)
             coefs[coord] = coef
 
     return coefs
@@ -785,15 +765,17 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
         clf.fit(X, Y)
     print('RF training done.')
 
-    rfaffinity = proximity_matrix(clf, X)
+    leaves = clf.apply(X)
+    rf_distance = proximity_from_leaves_parallel(
+        leaves, n_jobs=None, return_distance=True, dtype=np.float32)
     print('affinity generated.')
 
     signal, rfgram, medoid_indices = convert_least_squares(
-        rfaffinity,
+        rf_distance,
         Y,
         cluster_affinity, num_clstr)
-    Y = pd.Series([Y.iloc[i] for i in range(len(Y)) if i in medoid_indices])
 
+    Y = Y.iloc[medoid_indices].reset_index(drop=True)
     mags = mags[:, medoid_indices]
 
     # Drop synthetic “root-split” rows so rows map 1:1 to non-tips
@@ -871,8 +853,8 @@ def new_biplot3d(s, coefs, coordinates, mags, y,
         labels = [inv_map[i] for i in y]
 
     if labeltype == 'classification':
-
-        if len(y) == 2:
+        n_classes = len(np.unique(y))
+        if n_classes == 2:
             colors = cm.tab10(y/(2*max(y)))
         else:
             colors = cm.tab10(y/max(y))
@@ -952,7 +934,8 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,
         inv_map = {v: k for k, v in dic.items()}
         labels = [inv_map[i] for i in y]
     if labeltype == 'classification':
-        if len(y) == 2:
+        n_classes = len(np.unique(y))
+        if n_classes == 2:
             colors = cm.tab10(y / (2*max(y)))
         else:
             colors = cm.tab10(y / max(y))
