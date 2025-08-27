@@ -675,7 +675,8 @@ def haar_like_dist(table: biom.Table,
     mags = calc_haar_mags(haar_basis, abund_vec)
 
     D, modmags = compute_haar_dist(mags, diagonal)
-    D = DistanceMatrix(np.array(D.todense()))
+    ids = table.ids(axis='sample')
+    D = DistanceMatrix(np.asarray(D.todense()), ids)
     mm = csr_matrix(modmags)  # Going to see if this works w new format
     p = pcoa(D)
 

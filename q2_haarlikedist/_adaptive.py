@@ -944,7 +944,7 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,
     zs = score[:, 2]
     scalex = 1.0 / (xs.max() - xs.min())
     scaley = 1.0 / (ys.max() - ys.min())
-    scalez = 1.0 / (zs.max() - ys.min())
+    scalez = 1.0 / (zs.max() - zs.min())
     fig = plt.figure(figsize=(6, 8))
     ax = fig.add_subplot(projection='3d')
 
