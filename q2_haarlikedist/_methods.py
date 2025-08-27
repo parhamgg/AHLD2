@@ -707,7 +707,7 @@ def adaptive_visual(
 
         # heatmap info (per-coordinate detail saved; aggregation happens later)
         _save_tax_heatmap_info(
-            label, output_dir, annotated_tree, coordinates, taxonomy, species)
+            label, output_dir, annotated_tree, coordinates, species)
     else:
         species = {'coord 1': 'No taxonomy provided'}
 
