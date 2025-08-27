@@ -557,19 +557,12 @@ def _save_tax_heatmap_info(label: str,
                            coordinates: list[int],
                            species_dict: dict):
     """
-    Collects per-coordinate details needed for the three stacked taxonomic
-    heatmaps and saves them to <output_dir>/heatmap_info.pickle.
-
-    Stores *per-coordinate* metrics; final averaging/aggregation happens
-    in the external 'create_tax_heatmap.py' script.
-
-    Saved keys:
-      - variable
-      - max_root_distance
-      - per_coord: list of dicts with
-          {coord_index, node_label, lca, dist_to_root, nonoverlap_species_count,
-           species_left, species_right}
+    Collect per-coordinate info for taxonomic heatmaps and save to
+    <output_dir>/heatmap_info.pickle.
     """
+
+    os.makedirs(output_dir, exist_ok=True)
+
     # ---------- helpers ----------
     def _dist_to_root(n: skbio.TreeNode) -> float:
         d = 0.0
@@ -581,7 +574,7 @@ def _save_tax_heatmap_info(label: str,
         return d
 
     def _species_set_from_taxa_strings(taxa_strings):
-        """Extract only species-level names (after 's__'), drop empties."""
+        """Extract species names (after 's__'), drop empties."""
         spp = set()
         for t in taxa_strings:
             if not isinstance(t, str):
@@ -595,26 +588,51 @@ def _save_tax_heatmap_info(label: str,
                 spp.add(s_val)
         return spp
 
-    # Map coordinates -> actual nodes in the current tree
-    nontips = [x for x in tree.postorder() if not x.is_tip()]
-    max_root_distance = max((_dist_to_root(n)
-                            for n in tree.postorder(include_self=True)), default=0.0)
+    # Use the SAME traversal order as sparsify()/haar basis construction
+    nontips = list(tree.non_tips(include_self=True))
+
+    # scale: use internal nodes only (optional, but tighter)
+    try:
+        max_root_distance = max((_dist_to_root(n)
+                                for n in nontips), default=0.0)
+    except ValueError:
+        max_root_distance = 0.0
 
     per_coord = []
     for i, c in enumerate(coordinates):
-        node = nontips[c]
+        # robust node lookup
+        if 0 <= c < len(nontips):
+            node = nontips[c]
+        else:
+            # fallback: try attribute set during sparsify()
+            node = next((n for n in nontips if getattr(
+                n, 'postorder_pos', None) == c), None)
+            if node is None:
+                # cannot map this coordinate; skip gracefully
+                per_coord.append({
+                    'coord_index': int(c),
+                    'node_label': f'<unmapped:{c}>',
+                    'lca': None,
+                    'dist_to_root': float('nan'),
+                    'nonoverlap_species_count': 0,
+                    'species_left': [],
+                    'species_right': [],
+                })
+                continue
+
         node_label = getattr(node, 'name', str(c))
+        lca_text = node_label.split(':', 1)[1].strip() if isinstance(
+            node_label, str) and ':' in node_label else None
 
-        # LCA text (already computed in annotate_tree via find_common_clade)
-        lca_text = None
-        if isinstance(node_label, str) and ':' in node_label:
-            # annotate_tree set names like "<postorder>: <clade path>"
-            lca_text = node_label.split(':', 1)[1].strip()
+        # safer species lookup: match only on the "coord i:" prefix
+        key_prefix = f'coord {i}:'
+        key = next((k for k in species_dict.keys()
+                   if str(k).startswith(key_prefix)), None)
 
-        # Pull left/right taxa sets from 'species_dict' (already computed)
-        keyname = f'coord {i}: {node_label}'
-        left_taxa = species_dict.get(keyname, {}).get('left', set())
-        right_taxa = species_dict.get(keyname, {}).get('right', set())
+        left_taxa = species_dict.get(key, {}).get(
+            'left', set()) if key else set()
+        right_taxa = species_dict.get(key, {}).get(
+            'right', set()) if key else set()
 
         left_spp = _species_set_from_taxa_strings(left_taxa)
         right_spp = _species_set_from_taxa_strings(right_taxa)
@@ -711,8 +729,7 @@ def adaptive_visual(
     else:
         species = {'coord 1': 'No taxonomy provided'}
 
-    make_plots(adhld_results, modmags, output_dir, s, k, n,
-               tree=annotated_tree, tax_map=species)
+    make_plots(adhld_results, modmags, output_dir, s, k, n)
 
     s = save_species(species, output_dir)
     coords = ' '.join([str(x) for x in coordinates])

@@ -520,12 +520,16 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
         assert label in label_to_indices
         assert label in assignment_dict
         assert assignment_dict[label][0] > assignment_dict[label][1]
-        X_label = affinity[label_to_indices[label]]
+        idx = label_to_indices[label]
         final_assigned = assignment_dict[label][1]
-        km = KMedoids(n_clusters=final_assigned,
-                      random_state=random_state).fit(X_label)
-        selected_indices.extend(
-            label_to_indices[label][km.medoid_indices_].tolist())
+        # square RF distance block
+        D_sub = affinity[np.ix_(idx, idx)]
+        k = max(1, min(final_assigned, len(idx)))      # safety
+        km = KMedoids(n_clusters=k, metric='precomputed',
+                      init='heuristic',
+                      random_state=random_state,
+                      max_iter=300).fit(D_sub)
+        selected_indices.extend(idx[km.medoid_indices_].tolist())
 
     if verbose:
         print('\n~#$   Medoids   $#~:\n', selected_indices)
