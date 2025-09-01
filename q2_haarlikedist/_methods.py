@@ -28,7 +28,11 @@ from scipy.sparse import csr_matrix, lil_matrix, save_npz, load_npz
 from sklearn.metrics import silhouette_samples
 
 import q2templates
-from qiime2 import Metadata
+from qiime2 import Metadata, Artifact
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from qiime2.plugins.emperor.visualizers import plot as emperor_plot
 
 from pkg_resources import resource_filename
 
@@ -649,37 +653,33 @@ def _save_tax_heatmap_info(label: str,
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def save_emperor_pcoa_qzv(D_sparse,
-                          y_series,
-                          dic,
-                          out_dir,
-                          filename="interactive-pca.qzv",
-                          sample_ids=None):
-    """
-    Build a PCoA on the Haar-like distance, color by label, and save an
-    Emperor visualization as a .qzv file.
+def save_emperor_pca_qzv_from_biplot(coefs,
+                                     coordinates,
+                                     mags,
+                                     s,
+                                     y_series,
+                                     dic,
+                                     out_dir,
+                                     filename="interactive-pca.qzv",
+                                     standardize=True,
+                                     sample_ids=None):
 
-    Parameters
-    ----------
-    D_sparse   : scipy.sparse (n x n) symmetric, zero-diagonal distance
-    y_series   : pandas.Series of length n (labels; same order as D_sparse)
-    dic        : dict {readable_name -> code}; inverted for display
-    out_dir    : output directory
-    filename   : output filename (default 'interactive-pca.qzv')
-    sample_ids : optional list of sample IDs in the SAME order; if None,
-                 uses y_series.index (if present) or S0..Sn-1
-    """
-    import os
-    import numpy as np
-    import pandas as pd
-    from qiime2 import Artifact, Metadata
-    from qiime2.plugins.emperor.visualizers import plot as emperor_plot
-    from skbio.stats.distance import DistanceMatrix
-    from skbio.stats.ordination import pcoa
+    Z = np.transpose(reconstruct_coord(
+        coefs, coordinates, mags, s))
+    Z = np.asarray(Z, dtype=float)
 
-    n = len(y_series)
+    if standardize:
+        Z = StandardScaler().fit_transform(Z)
 
-    # --- choose sample IDs (must match distance ordering exactly) ---
+    pca = PCA()
+    scores = pca.fit_transform(Z)
+    eigvals = pca.explained_variance_
+    ratios = pca.explained_variance_ratio_
+
+    n, p = scores.shape
+    pc_labels = [f"PC{i+1}" for i in range(p)]
+
+    # ----- sample IDs & metadata -----
     if sample_ids is not None:
         ids = [str(x) for x in sample_ids]
     elif getattr(y_series, "index", None) is not None and len(y_series.index) == n:
@@ -687,31 +687,27 @@ def save_emperor_pcoa_qzv(D_sparse,
     else:
         ids = [f"S{i}" for i in range(n)]
 
-    # --- distance matrix for skbio ---
-    D = np.asarray(D_sparse.todense(), dtype=float)
-    D = 0.5 * (D + D.T)
-    np.fill_diagonal(D, 0.0)
-    dm = DistanceMatrix(D, ids)
+    inv = {v: k for k, v in dic.items()}  # code -> readable name
+    md_df = pd.DataFrame({"group": [inv[int(v)] for v in y_series]}, index=ids)
+    md_df.index.name = "sample-id"  # required by QIIME 2
+    md = Metadata(md_df)
 
-    # --- PCoA ---
-    ord_res = pcoa(dm)
+    # ----- ordination (PCA wrapped as a "PCoAResults"-compatible object) -----
+    samples_df = pd.DataFrame(scores, index=ids, columns=pc_labels)
+    ord_res = OrdinationResults(
+        short_method_name="PCA",
+        long_method_name="Principal Components Analysis",
+        eigvals=pd.Series(eigvals, index=pc_labels),
+        samples=samples_df,
+        proportion_explained=pd.Series(ratios, index=pc_labels)
+    )
 
-    # --- Emperor metadata (index name MUST be QIIME-compatible) ---
-    inv = {v: k for k, v in dic.items()}  # code -> human label
-    meta_df = pd.DataFrame(
-        {"group": [inv[int(v)] for v in y_series]}, index=ids)
-    meta_df.index.name = "sample-id"  # required by QIIME 2
-    md = Metadata(meta_df)
-
-    # --- package ordination as artifact ---
+    # Package as QIIME2 artifact and plot with Emperor
     ord_art = Artifact.import_data("PCoAResults", ord_res)
+    viz = emperor_plot(ord_art, md)   # positional args for broad compatibility
 
-    # --- call emperor.plot POSITIONALLY (older q2-emperor rejects kwargs) ---
-    viz = emperor_plot(ord_art, md)
-
-    # q2-emperor typically returns a Visualization with .save(...)
-    # but be defensive across versions:
     out_path = os.path.join(out_dir, filename)
+    # robust save across versions
     if hasattr(viz, "save"):
         viz.save(out_path)
     elif hasattr(viz, "visualization") and hasattr(viz.visualization, "save"):
@@ -723,9 +719,7 @@ def save_emperor_pcoa_qzv(D_sparse,
 
 
 def haar_like_dist(table: biom.Table,
-                   tree: skbio.TreeNode) \
-    -> (DistanceMatrix, skbio.TreeNode,
-        csr_matrix, OrdinationResults):  # type: ignore
+                   tree: skbio.TreeNode):
     """ Returns D, tree, mm. Distance matrix and significance.
         Returns distance matrix and formatted tree.
         This now returns modmags as a biom table, which
@@ -758,7 +752,7 @@ def adaptive_visual(
     k: int = 5,
     n: int = 5,
     cluster_affinity: bool = True,
-    num_clstr: int = 2000,
+    num_clstr: int = 6000,
     tune: bool = False
 ) -> None:
 
@@ -774,7 +768,7 @@ def adaptive_visual(
     adhld_results = adaptive(haar_basis, biom_table, label,
                              tree, meta, s, cluster_affinity, num_clstr, tune)
 
-    _, coordinates, _, Y, dic, diagonal, mags = adhld_results
+    _, coordinates, coefs, Y, dic, diagonal, mags = adhld_results
 
     Distances, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
@@ -782,13 +776,13 @@ def adaptive_visual(
     # Save silhouettes for this variable (radar plot source)
     _save_silhouettes(output_dir, Distances, Y, label)
 
-    # NEW: write an interactive Emperor visualization as a .qzv
+    # Interactive PCA from HLD biplot features
     try:
-        save_emperor_pcoa_qzv(
-            Distances, Y, dic, output_dir, "interactive-pca.qzv")
-        print("Saved Emperor visualization to interactive-pca.qzv")
+        save_emperor_pca_qzv_from_biplot(coefs, coordinates, mags, s, Y, dic, output_dir,
+                                         filename="interactive-pca.qzv", standardize=True, sample_ids=None)
+        print("Saved Emperor PCA (feature-based) to interactive-pca.qzv")
     except Exception as e:
-        print(f"[WARN] Unable to write Emperor visualization: {e}")
+        print(f"[WARN] Unable to write Emperor PCA visualization: {e}")
 
     # Get context to send to HTML file
     annotated_tree = tree

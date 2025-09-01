@@ -737,7 +737,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
         print('tuning RF hyperparams...')
         best_params, study = tune_rf_params_sklearn(
             X, np.asarray(Y),
-            n_trials=25,
+            n_trials=35,
             subsample_cap=min(num_clstr, len(Y)),
             mds_dim=50,
             random_state=42,
