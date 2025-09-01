@@ -649,6 +649,79 @@ def _save_tax_heatmap_info(label: str,
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def save_emperor_pcoa_qzv(D_sparse,
+                          y_series,
+                          dic,
+                          out_dir,
+                          filename="interactive-pca.qzv",
+                          sample_ids=None):
+    """
+    Build a PCoA on the Haar-like distance, color by label, and save an
+    Emperor visualization as a .qzv file.
+
+    Parameters
+    ----------
+    D_sparse   : scipy.sparse (n x n) symmetric, zero-diagonal distance
+    y_series   : pandas.Series of length n (labels; same order as D_sparse)
+    dic        : dict {readable_name -> code}; inverted for display
+    out_dir    : output directory
+    filename   : output filename (default 'interactive-pca.qzv')
+    sample_ids : optional list of sample IDs in the SAME order; if None,
+                 uses y_series.index (if present) or S0..Sn-1
+    """
+    import os
+    import numpy as np
+    import pandas as pd
+    from qiime2 import Artifact, Metadata
+    from qiime2.plugins.emperor.visualizers import plot as emperor_plot
+    from skbio.stats.distance import DistanceMatrix
+    from skbio.stats.ordination import pcoa
+
+    n = len(y_series)
+
+    # --- choose sample IDs (must match distance ordering exactly) ---
+    if sample_ids is not None:
+        ids = [str(x) for x in sample_ids]
+    elif getattr(y_series, "index", None) is not None and len(y_series.index) == n:
+        ids = [str(x) for x in y_series.index]
+    else:
+        ids = [f"S{i}" for i in range(n)]
+
+    # --- distance matrix for skbio ---
+    D = np.asarray(D_sparse.todense(), dtype=float)
+    D = 0.5 * (D + D.T)
+    np.fill_diagonal(D, 0.0)
+    dm = DistanceMatrix(D, ids)
+
+    # --- PCoA ---
+    ord_res = pcoa(dm)
+
+    # --- Emperor metadata (index name MUST be QIIME-compatible) ---
+    inv = {v: k for k, v in dic.items()}  # code -> human label
+    meta_df = pd.DataFrame(
+        {"group": [inv[int(v)] for v in y_series]}, index=ids)
+    meta_df.index.name = "sample-id"  # required by QIIME 2
+    md = Metadata(meta_df)
+
+    # --- package ordination as artifact ---
+    ord_art = Artifact.import_data("PCoAResults", ord_res)
+
+    # --- call emperor.plot POSITIONALLY (older q2-emperor rejects kwargs) ---
+    viz = emperor_plot(ord_art, md)
+
+    # q2-emperor typically returns a Visualization with .save(...)
+    # but be defensive across versions:
+    out_path = os.path.join(out_dir, filename)
+    if hasattr(viz, "save"):
+        viz.save(out_path)
+    elif hasattr(viz, "visualization") and hasattr(viz.visualization, "save"):
+        viz.visualization.save(out_path)
+    else:
+        raise RuntimeError(
+            "Unexpected return type from emperor.plot; cannot save.")
+    return out_path
+
+
 def haar_like_dist(table: biom.Table,
                    tree: skbio.TreeNode) \
     -> (DistanceMatrix, skbio.TreeNode,
@@ -701,13 +774,21 @@ def adaptive_visual(
     adhld_results = adaptive(haar_basis, biom_table, label,
                              tree, meta, s, cluster_affinity, num_clstr, tune)
 
-    _, _, coordinates, _, Y, _, diagonal, mags = adhld_results
+    _, coordinates, _, Y, dic, diagonal, mags = adhld_results
 
     Distances, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
 
     # Save silhouettes for this variable (radar plot source)
     _save_silhouettes(output_dir, Distances, Y, label)
+
+    # NEW: write an interactive Emperor visualization as a .qzv
+    try:
+        save_emperor_pcoa_qzv(
+            Distances, Y, dic, output_dir, "interactive-pca.qzv")
+        print("Saved Emperor visualization to interactive-pca.qzv")
+    except Exception as e:
+        print(f"[WARN] Unable to write Emperor visualization: {e}")
 
     # Get context to send to HTML file
     annotated_tree = tree

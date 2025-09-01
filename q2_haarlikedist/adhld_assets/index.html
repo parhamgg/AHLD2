@@ -49,6 +49,61 @@
 </div>
 
 <div class="section">
+  <h2>Interactive PCA (Emperor)</h2>
+  <p>Explore the ordination interactively (colored by “{{ label }}”).</p>
+
+  <p>
+    <button id="emperor-download-btn" class="btn">Download <code>interactive-pca.qzv</code></button>
+    <a id="emperor-download-fallback" href="interactive-pca.qzv" download style="display:none; margin-left:8px;">
+      Fallback direct link
+    </a>
+  </p>
+
+  <p style="font-size:0.95em;color:#555">
+    Tip: Drag the downloaded file onto
+    <a href="https://view.qiime2.org" target="_blank" rel="noopener">QIIME 2 View</a>.
+  </p>
+</div>
+
+<script>
+// Robust binary download of an embedded asset inside a QZV.
+(function () {
+  const PATH = 'interactive-pca.qzv';
+  const BTN = document.getElementById('emperor-download-btn');
+  const FALLBACK = document.getElementById('emperor-download-fallback');
+
+  BTN?.addEventListener('click', async () => {
+    try {
+      const resp = await fetch(PATH);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const blob = await resp.blob();
+
+      // Heuristic: if it's suspiciously tiny, it's likely a text error page.
+      if (blob.size < 10_000) {
+        // Show fallback link and tell the user.
+        FALLBACK.style.display = 'inline';
+        alert('Download looked corrupted (too small). Use the fallback link, or unzip visualization.qzv to extract interactive-pca.qzv.');
+        return;
+      }
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'interactive-pca.qzv';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+    } catch (err) {
+      console.error('[emperor download] ', err);
+      FALLBACK.style.display = 'inline';
+      alert('Could not fetch the file automatically. Use the fallback link or unzip visualization.qzv.');
+    }
+  });
+})();
+</script>
+
+
+<div class="section">
   <h2>Postorder internal node indices</h2>
   The following are the coordinates of the internal nodes found to be most important: {{ coordinates }}
 </div>
@@ -64,8 +119,4 @@
   The variable of interest used for this analysis was: {{ label }}
 </div>
 
-<div class="section">
-  <h2>Circular Phylogeny Highlighting Top Haar-like Coordinates</h2>
-  <img class="plot tall" src="itol.svg" alt="Circular phylogeny with highlighted clades">
-</div>
 {% endblock %}

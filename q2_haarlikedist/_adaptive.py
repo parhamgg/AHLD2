@@ -364,7 +364,7 @@ def rf_kta_objective_sklearn(trial,
     Lc, Lc_norm = make_label_kernel(ys)
     loss = kta_score(K, Lc, Lc_norm)
 
-    # record component times for your logs
+    # record component times for logs
     trial.set_user_attr("t_fit", t_fit)
     trial.set_user_attr("t_prox", t_prox)
     trial.set_user_attr("t_mds", t_mds)
@@ -792,7 +792,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
     new_diag = diag_impo(mags, coordinates, coefs)
     print('diag created.')
 
-    return dic, rfgram, coordinates, coefs, Y, dic, new_diag, mags
+    return rfgram, coordinates, coefs, Y, dic, new_diag, mags
 
 
 def reconstruct_coord(coefs, coordinates, mags, s):
@@ -1083,52 +1083,111 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
-def boxplot_plotter(mags, y, indices, dic,
-                    xlabels, save, path):
+def compute_ilr_for_nodes(tree, table_df, node_indices, pseudocount=1e-6, scale='ilr'):
+    """
+    table_df: pd.DataFrame of counts/abund (samples x tips), columns are tip names (OTU ids)
+    node_indices: iterable of internal-node row indices (same indexing as your 'mags' rows)
+    scale: 'ilr' for sqrt(|L||R|/(|L|+|R|)) scaling, or 'none' for plain log-ratio
+    returns: array of shape (len(node_indices), n_samples)
+    """
+    # reorder columns to tree tip order -> tips x samples
+    tip_names = [t.name for t in tree.tips()]
+    X = table_df.reindex(columns=tip_names, fill_value=0).T.values
+    # closure to compositional
+    X = X / (X.sum(axis=0, keepdims=True) + 1e-15)
+    X = X + pseudocount
 
-    fig, ax = plt.subplots(len(indices), sharex=True,
-                           figsize=(14, 2.5 * len(indices)))
+    # index map for tips
+    tip_idx = {name: i for i, name in enumerate(tip_names)}
+
+    # internal nodes in postorder (index must match your mags row order)
+    internal_nodes = [n for n in tree.postorder() if not n.is_tip()]
+    out = []
+
+    for node_id in node_indices:
+        node = internal_nodes[node_id]
+        kids = list(node.children)
+        if len(kids) != 2:
+            raise ValueError(
+                'Tree must be strictly bifurcating for ILR balances.')
+
+        L_leaves = [tip_idx[t.name] for t in kids[0].tips()]
+        R_leaves = [tip_idx[t.name] for t in kids[1].tips()]
+
+        L = X[L_leaves, :]
+        R = X[R_leaves, :]
+
+        # mean log (i.e., log geometric mean)
+        mlogL = np.mean(np.log(L), axis=0)
+        mlogR = np.mean(np.log(R), axis=0)
+        bal = mlogL - mlogR
+
+        if scale == 'ilr':
+            g = np.sqrt(len(L_leaves) * len(R_leaves) /
+                        (len(L_leaves) + len(R_leaves)))
+            bal = g * bal
+
+        out.append(bal)
+
+    return np.vstack(out)  # (len(node_indices), n_samples)
+
+
+def boxplot_plotter(mags, y, indices, dic, xlabels, save, path, coefs=None, scale='sqrt'):
+    """
+    scale: 'none' | 'sqrt' | 'coef'
+      - 'sqrt' -> multiply node k by sqrt(coefs[k])  (matches biplot)
+      - 'coef' -> multiply by coefs[k]
+      - 'none' -> raw mags (prev/default behavior)
+    """
+
+    n_panels = len(indices)
+    fig, ax = plt.subplots(n_panels, sharex=True, figsize=(14, 2.5 * n_panels))
+    if n_panels == 1:
+        ax = np.array([ax])
+
     boxlabels = list(dic.keys())
     inv_map = {v: k for k, v in dic.items()}
     datalabels = [inv_map[i] for i in y]
-    for k in range(len(indices)):
-        alldata = []
-        for i in range(len(boxlabels)):
-            dataindices = [
-                j
-                for j, x in enumerate(datalabels)
-                if x == boxlabels[i]]
-            alldata.append(
-                np.asarray(mags[indices[k], dataindices].todense()).squeeze())
 
-        temp = ax[k].boxplot(alldata,
-                             vert=True,  # vertical box alignment
-                             patch_artist=True,  # fill with color
-                             labels=xlabels)  # will be used to label x-ticks
-        ax[k].set_title('Haar-like Node' + ' ' + str(indices[k]))
+    for k in range(n_panels):
+        alldata = []
+        for i, lbl in enumerate(boxlabels):
+            dataindices = [j for j, x in enumerate(datalabels) if x == lbl]
+            if not dataindices:
+                alldata.append(np.array([]))
+                continue
+
+            vals = mags[indices[k], dataindices]
+            vals = vals.A1 if hasattr(vals, 'A1') else (np.asarray(vals.todense()).ravel()
+                                                        if hasattr(vals, 'todense') else np.asarray(vals).ravel())
+
+            if coefs is not None and scale != 'none':
+                w = np.sqrt(coefs[k]) if scale == 'sqrt' else coefs[k]
+                vals = w * vals
+
+            alldata.append(vals)
+
+        temp = ax[k].boxplot(alldata, vert=True,
+                             patch_artist=True, labels=xlabels)
+        ax[k].set_title('Haar-like Node ' + str(indices[k]))
         plt.setp(temp['whiskers'], color='black')
         plt.setp(temp['medians'], color='black')
         plt.setp(temp['fliers'], color='black', marker='')
 
-        numerator = np.array(list(dic.values()))
-        if len(y) == 2:
-            denominator = (2 * max(np.array(list(dic.values()))))
-            colors = cm.tab10(numerator / denominator)
-        else:
-            denominator = (max(np.array(list(dic.values()))))
-            colors = cm.tab10(numerator / denominator)
-
+        nums = np.array(list(dic.values()))
+        denom = 2 * nums.max() if len(np.unique(y)) == 2 else nums.max()
+        colors = cm.tab10(nums / denom)
         for patch, color in zip(temp['boxes'], colors):
             patch.set_facecolor(color)
 
-    if save == True:
+    if save:
         plt.savefig(path, dpi=400, bbox_inches='tight')
 
 
 def make_plots(adhld_results, modmags, path, s, k, n):
 
     # unpack reslts
-    dic, rfgram, coordinates, coefs, Y, dic, _, _ = adhld_results
+    rfgram, coordinates, coefs, Y, dic, _, _ = adhld_results
 
     # define paths to save all 4 plots
     path1 = os.path.join(path, 'rfgram.svg')
@@ -1142,7 +1201,7 @@ def make_plots(adhld_results, modmags, path, s, k, n):
 
     # BOXPLOTS OF NODES
     boxplot_plotter(modmags, Y.values, coordinates[0:s], dic,
-                    dic.keys(), save=True, path=path2)
+                    dic.keys(), True, path2, coefs)
 
     # BIPLOT
     new_biplot3d(s, coefs, coordinates, modmags, Y,
