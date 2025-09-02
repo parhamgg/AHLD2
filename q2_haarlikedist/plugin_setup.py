@@ -1,4 +1,3 @@
-import q2_haarlikedist._transformer
 import importlib
 
 from qiime2.plugin import (Plugin, Citations, Str, Int, Bool, Metadata)
@@ -123,7 +122,7 @@ plugin.visualizers.register_function(
         'cluster_affinity': ('Subsampling with clustering of tree representation affinity when sample size is big '
                              '(default: True).'),
         'num_clstr': ('Number of clusters for clustering step '
-                      '(default: 6000).'),
+                      '(default: 2000).'),
         'tune': ('Tune RF hyperparameters - slows down the pipeline (default: False)'),
     },
     name='adaptive-visual',
@@ -190,3 +189,5 @@ plugin.methods.register_function(
         citations['Gorman2022'],
     ]
 )
+
+import q2_haarlikedist._transformer

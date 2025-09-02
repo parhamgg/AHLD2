@@ -719,7 +719,7 @@ def save_emperor_pca_qzv_from_biplot(coefs,
 
 
 def haar_like_dist(table: biom.Table,
-                   tree: skbio.TreeNode):
+                   tree: skbio.TreeNode) -> (skbio.DistanceMatrix, skbio.TreeNode, csr_matrix, OrdinationResults):
     """ Returns D, tree, mm. Distance matrix and significance.
         Returns distance matrix and formatted tree.
         This now returns modmags as a biom table, which
