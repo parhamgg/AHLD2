@@ -32,7 +32,7 @@ __all__ = [
     'proximity_from_leaves_parallel',
     'mds_full_randomized',
     'convert_least_squares',
-    'matching_pursuit_lazy_parallel',
+    'matching_pursuit_sequential_parallel',
     'diag_impo',
     'adaptive',
     'reconstruct_coord',
@@ -593,7 +593,7 @@ def _score_chunk_return_arrays(chunk_indices, sub_chunk, M, row_sq_norms):
     return chunk_indices, nums, denoms, scores
 
 
-def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
+def matching_pursuit_sequential_parallel(signal, sub_mags, s, n_jobs=None):
     """
     Parallel matching pursuit that is exact-equivalent to the serial implementation.
     - signal: sparse vector (n_samples**2, 1), Fortran-order vec(M)
@@ -601,7 +601,7 @@ def matching_pursuit_lazy_parallel(signal, sub_mags, s, n_jobs=None):
     - s: number of atoms to select
     - n_jobs: number of threads (defaults to min(cpu_count(), n_bases))
 
-    Returns: indices, coefs (same semantics as serial matching_pursuit_lazy).
+    Returns: indices, coefs.
     """
     if not isinstance(sub_mags, csr_matrix):
         sub_mags = csr_matrix(sub_mags)
@@ -784,7 +784,7 @@ def adaptive(haar_basis, biom_table, label, tree, meta, s, cluster_affinity, num
         mags = mags[:nontips_count, :]
 
     st = time.time()
-    coordinates, coefs = matching_pursuit_lazy_parallel(signal, mags, s)
+    coordinates, coefs = matching_pursuit_sequential_parallel(signal, mags, s)
     print(coordinates)
     print(coefs)
     print(f'signal estimated with Haar coefs in {time.time() - st} seconds.')
