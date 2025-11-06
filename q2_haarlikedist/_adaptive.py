@@ -921,6 +921,7 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,
     x_new = pca.fit_transform(Z)
     score = x_new[:, 0:3]
     coeff = np.transpose(pca.components_[0:3, :])
+    print('~#$ coeffs for the black arrows:\n', coeff)
     xs = score[:, 0]
     ys = score[:, 1]
     zs = score[:, 2]
