@@ -617,7 +617,7 @@ def matching_pursuit_sequential_parallel(signal, sub_mags, s, n_jobs=None):
     M = csr_matrix(R_vec.reshape(
         (n_samples, n_samples), order='F'), dtype=np.float64)
 
-    # precompute denom (||u||^2) exactly as serial
+    # precompute denom (||u||^2)
     row_sq_norms = np.asarray(sub_mags.power(2).sum(
         axis=1)).reshape(-1).astype(np.float64)
 
