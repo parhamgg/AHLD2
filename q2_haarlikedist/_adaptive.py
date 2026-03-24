@@ -92,16 +92,6 @@ def preprocess(label, biom_table, haar_basis, metadata, tree):
     abundance_vector = get_otu_abundances(X, tree)
     mags = calc_haar_mags(haar_basis, abundance_vector)
 
-    # Save outputs for comparison
-    print("X shape:", X.shape)
-    print(type(X))
-    print(X)
-    print("Y shape:", Y.shape)
-    print(type(Y))
-    print("abundance_vector shape:", abundance_vector.shape)
-    print("mags shape:", mags.shape)
-    print("haar_basis shape:", haar_basis.shape)
-
     # Normalize X
     sums = X.to_numpy().sum(axis=1)
     X = X.div(sums, axis=0)
@@ -210,10 +200,10 @@ def mds_full_randomized(D, dim=50, n_oversamples=10, random_state=None):
 
 
 def center_gram(K: np.ndarray) -> np.ndarray:
+    """Double-center a Gram/similarity matrix K."""
     if not isinstance(K, np.ndarray):
         K = K.toarray()
 
-    """Double-center a Gram/similarity matrix K."""
     row_mean = K.mean(axis=1, keepdims=True)
     col_mean = K.mean(axis=0, keepdims=True)
     total_mean = K.mean()
@@ -511,8 +501,6 @@ def select_hybrid_balanced_medoids(affinity, Y, target_total, random_state=0, ve
                       max_iter=300).fit(D_sub)
         selected_indices.extend(idx[km.medoid_indices_].tolist())
 
-    if verbose:
-        print('\n~#$   Medoids   $#~:\n', selected_indices)
     # Preserve original order
     ordered = np.sort(np.asarray(selected_indices))
     return ordered
@@ -707,7 +695,7 @@ def diag_impo(mags, coordinates, coefficients):
             print(
                 f"Warning: suspiciously large coefficient {coef} at coord {coord}")
 
-        if not coord in assigned:
+        if coord not in assigned:
             assigned.add(coord)
             coefs[coord] = coef
 
@@ -921,7 +909,6 @@ def new_biplot3dnormalized(s, coefs, coordinates, mags, y,
     x_new = pca.fit_transform(Z)
     score = x_new[:, 0:3]
     coeff = np.transpose(pca.components_[0:3, :])
-    print('~#$ coeffs for the black arrows:\n', coeff)
     xs = score[:, 0]
     ys = score[:, 1]
     zs = score[:, 2]
@@ -1082,55 +1069,6 @@ def rfgram_plot(rfgram, coordinates, modmags, s, coefs, Y, dic,
 
     if save == True:
         plt.savefig(path, dpi=400, bbox_inches='tight')
-
-
-def compute_ilr_for_nodes(tree, table_df, node_indices, pseudocount=1e-6, scale='ilr'):
-    """
-    table_df: pd.DataFrame of counts/abund (samples x tips), columns are tip names (OTU ids)
-    node_indices: iterable of internal-node row indices (same indexing as your 'mags' rows)
-    scale: 'ilr' for sqrt(|L||R|/(|L|+|R|)) scaling, or 'none' for plain log-ratio
-    returns: array of shape (len(node_indices), n_samples)
-    """
-    # reorder columns to tree tip order -> tips x samples
-    tip_names = [t.name for t in tree.tips()]
-    X = table_df.reindex(columns=tip_names, fill_value=0).T.values
-    # closure to compositional
-    X = X / (X.sum(axis=0, keepdims=True) + 1e-15)
-    X = X + pseudocount
-
-    # index map for tips
-    tip_idx = {name: i for i, name in enumerate(tip_names)}
-
-    # internal nodes in postorder (index must match your mags row order)
-    internal_nodes = [n for n in tree.postorder() if not n.is_tip()]
-    out = []
-
-    for node_id in node_indices:
-        node = internal_nodes[node_id]
-        kids = list(node.children)
-        if len(kids) != 2:
-            raise ValueError(
-                'Tree must be strictly bifurcating for ILR balances.')
-
-        L_leaves = [tip_idx[t.name] for t in kids[0].tips()]
-        R_leaves = [tip_idx[t.name] for t in kids[1].tips()]
-
-        L = X[L_leaves, :]
-        R = X[R_leaves, :]
-
-        # mean log (i.e., log geometric mean)
-        mlogL = np.mean(np.log(L), axis=0)
-        mlogR = np.mean(np.log(R), axis=0)
-        bal = mlogL - mlogR
-
-        if scale == 'ilr':
-            g = np.sqrt(len(L_leaves) * len(R_leaves) /
-                        (len(L_leaves) + len(R_leaves)))
-            bal = g * bal
-
-        out.append(bal)
-
-    return np.vstack(out)  # (len(node_indices), n_samples)
 
 
 def boxplot_plotter(mags, y, indices, dic, xlabels, save, path, coefs=None, scale='sqrt'):

@@ -15,17 +15,12 @@ import pandas as pd
 import os
 import hashlib
 import time
-import pickle
 
-from skbio import read
-from skbio.tree import TreeNode
 from skbio.stats.distance import DistanceMatrix
 from skbio.stats.ordination import OrdinationResults
 from skbio.stats.ordination import pcoa
 
 from scipy.sparse import csr_matrix, lil_matrix, save_npz, load_npz
-
-from sklearn.metrics import silhouette_samples
 
 import q2templates
 from qiime2 import Metadata, Artifact
@@ -38,14 +33,6 @@ from pkg_resources import resource_filename
 
 from ._adaptive import *
 
-
-def get_tree_from_file(tree_file):
-    """ Used only for testing and development. """
-
-    f = open(tree_file, 'r')
-    t2 = read(f, format='newick', into=TreeNode)
-    f.close()
-    return t2
 
 
 def initiate_values(t2):
@@ -299,7 +286,6 @@ def get_haar_basis(tree, cache_dir="cache/"):
     os.makedirs(cache_dir, exist_ok=True)  # Ensure cache directory exists
     tree_id = fast_tree_hash(tree)  # Fast unique tree identifier
     cache_path = os.path.join(cache_dir, f"haar_basis_{tree_id}.npz")
-    print('cache path:', os.getcwd(), cache_path)
 
     if os.path.exists(cache_path):
         print(f"Loading cached Haar basis for tree {tree_id}...")
@@ -498,161 +484,6 @@ def save_species(species, output_dir):
     return s
 
 
-def _save_silhouettes(output_dir: str, D_sparse, y_series: pd.Series, variable: str):
-    """
-    Compute per-sample silhouette scores from a *precomputed* distance matrix
-    and save them to <output_dir>/silhouttes.pickle.
-
-    Parameters
-    ----------
-    output_dir : str
-        Folder for this variable's outputs.
-    D_sparse : scipy.sparse matrix (nsamples x nsamples)
-        Haar-like *distance* matrix (symmetric, zero diagonal).
-    y_series : pd.Series
-        Labels for the samples in the same order as D_sparse.
-    variable : str
-        Variable name (label) for bookkeeping.
-    """
-    y = np.asarray(list(y_series))
-    classes, counts = np.unique(y, return_counts=True)
-
-    payload = {
-        'variable': variable,
-        'classes': classes.tolist(),
-        'class_counts': counts.tolist(),
-        'scores': None,
-        'mean': np.nan,
-        'metric': 'precomputed',
-        'note': ''
-    }
-
-    # Silhouette requires at least two classes with at least 2 samples each
-    if len(classes) < 2 or np.any(counts < 2):
-        payload['note'] = 'insufficient class structure for silhouette'
-        with open(os.path.join(output_dir, 'silhouttes.pickle'), 'wb') as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return
-
-    # sklearn expects dense for metric='precomputed'
-    D = np.asarray(D_sparse.todense())
-    np.fill_diagonal(D, 0.0)
-
-    scores = silhouette_samples(D, y, metric='precomputed')
-    payload['scores'] = scores.astype(np.float32)
-    payload['mean'] = float(np.nanmean(scores))
-
-    with open(os.path.join(output_dir, 'silhouttes.pickle'), 'wb') as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _save_tax_heatmap_info(label: str,
-                           output_dir: str,
-                           tree: skbio.TreeNode,
-                           coordinates: list[int],
-                           species_dict: dict):
-    """
-    Collect per-coordinate info for taxonomic heatmaps and save to
-    <output_dir>/heatmap_info.pickle.
-    """
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # ---------- helpers ----------
-    def _dist_to_root(n: skbio.TreeNode) -> float:
-        d = 0.0
-        cur = n
-        while cur is not None:
-            if getattr(cur, 'length', None):
-                d += float(cur.length)
-            cur = cur.parent
-        return d
-
-    def _species_set_from_taxa_strings(taxa_strings):
-        """Extract species names (after 's__'), drop empties."""
-        spp = set()
-        for t in taxa_strings:
-            if not isinstance(t, str):
-                continue
-            parts = [p.strip() for p in t.split(';')]
-            s_parts = [p for p in parts if p.startswith('s__')]
-            if not s_parts:
-                continue
-            s_val = s_parts[-1][3:].strip()  # after 's__'
-            if s_val:
-                spp.add(s_val)
-        return spp
-
-    # Use the SAME traversal order as sparsify()/haar basis construction
-    nontips = list(tree.non_tips(include_self=True))
-
-    # scale: use internal nodes only (optional, but tighter)
-    try:
-        max_root_distance = max((_dist_to_root(n)
-                                for n in nontips), default=0.0)
-    except ValueError:
-        max_root_distance = 0.0
-
-    per_coord = []
-    for i, c in enumerate(coordinates):
-        # robust node lookup
-        if 0 <= c < len(nontips):
-            node = nontips[c]
-        else:
-            # fallback: try attribute set during sparsify()
-            node = next((n for n in nontips if getattr(
-                n, 'postorder_pos', None) == c), None)
-            if node is None:
-                # cannot map this coordinate; skip gracefully
-                per_coord.append({
-                    'coord_index': int(c),
-                    'node_label': f'<unmapped:{c}>',
-                    'lca': None,
-                    'dist_to_root': float('nan'),
-                    'nonoverlap_species_count': 0,
-                    'species_left': [],
-                    'species_right': [],
-                })
-                continue
-
-        node_label = getattr(node, 'name', str(c))
-        lca_text = node_label.split(':', 1)[1].strip() if isinstance(
-            node_label, str) and ':' in node_label else None
-
-        # safer species lookup: match only on the "coord i:" prefix
-        key_prefix = f'coord {i}:'
-        key = next((k for k in species_dict.keys()
-                   if str(k).startswith(key_prefix)), None)
-
-        left_taxa = species_dict.get(key, {}).get(
-            'left', set()) if key else set()
-        right_taxa = species_dict.get(key, {}).get(
-            'right', set()) if key else set()
-
-        left_spp = _species_set_from_taxa_strings(left_taxa)
-        right_spp = _species_set_from_taxa_strings(right_taxa)
-        nonoverlap = len(left_spp.symmetric_difference(right_spp))
-
-        per_coord.append({
-            'coord_index': int(c),
-            'node_label': node_label,
-            'lca': lca_text,
-            'dist_to_root': float(_dist_to_root(node)),
-            'nonoverlap_species_count': int(nonoverlap),
-            'species_left': sorted(left_spp),
-            'species_right': sorted(right_spp),
-        })
-
-    payload = {
-        'variable': label,
-        'max_root_distance': float(max_root_distance),
-        'per_coord': per_coord,
-    }
-
-    with open(os.path.join(output_dir, 'heatmap_info.pickle'), 'wb') as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
 def save_emperor_pca_qzv_from_biplot(coefs,
                                      coordinates,
                                      mags,
@@ -770,11 +601,8 @@ def adaptive_visual(
 
     _, coordinates, coefs, Y, dic, diagonal, mags = adhld_results
 
-    Distances, modmags = compute_haar_dist(mags, diagonal)
+    _, modmags = compute_haar_dist(mags, diagonal)
     modmags = modmags.T
-
-    # Save silhouettes for this variable (radar plot source)
-    _save_silhouettes(output_dir, Distances, Y, label)
 
     # Interactive PCA from HLD biplot features
     try:
@@ -789,10 +617,6 @@ def adaptive_visual(
     if taxonomy:
         annotated_tree, taxonomy = annotate_tree(tree, taxonomy)
         species = get_species(annotated_tree, coordinates, taxonomy)
-
-        # heatmap info (per-coordinate detail saved; aggregation happens later)
-        _save_tax_heatmap_info(
-            label, output_dir, annotated_tree, coordinates, species)
     else:
         species = {'coord 1': 'No taxonomy provided'}
 
@@ -830,9 +654,10 @@ def adaptive_distance(
     haar_basis = get_haar_basis(tree)
     meta = metadata.to_dataframe()
 
-    adhld_results = adaptive(haar_basis, table, label, tree, meta, s)
+    adhld_results = adaptive(haar_basis, table, label, tree, meta, s,
+                             cluster_affinity=True, num_clstr=6000, tune=False)
 
-    _, _, _, _, _, _, diagonal, mags = adhld_results
+    _, _, _, _, _, diagonal, mags = adhld_results
 
     D, modmags = compute_haar_dist(mags, diagonal)
 

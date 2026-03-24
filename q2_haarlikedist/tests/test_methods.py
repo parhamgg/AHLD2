@@ -6,7 +6,6 @@ import skbio
 import biom
 from os.path import dirname, abspath, join
 from inspect import currentframe, getfile
-import inspect
 
 from q2_haarlikedist._methods import (initiate_values,
                                       get_case,
@@ -20,21 +19,18 @@ from q2_haarlikedist._methods import (initiate_values,
                                       handle_left,
                                       handle_right,
                                       handle_both,
-                                      # create_branching_tree,
                                       sparsify,
                                       get_lambda,
                                       match_to_tree,
                                       compute_haar_dist,
-                                      # haar_like_dist,
-                                      get_lambdas)
+                                      get_lambdas,
+                                      get_otu_abundances,
+                                      calc_haar_mags)
 
 
 class TestSparsify(TestCase):
 
     def setUp(self):
-
-        source_code = inspect.getsource(match_to_tree)
-        print(source_code)
 
         path = dirname(abspath(getfile(currentframe())))
 
@@ -59,7 +55,7 @@ class TestSparsify(TestCase):
 
         expected = scipy.sparse.lil_matrix((self.ntips, self.ntips))
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         assert (lilmat != expected).nnz == 0
@@ -89,7 +85,7 @@ class TestSparsify(TestCase):
 
     def test_get_case(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -109,7 +105,7 @@ class TestSparsify(TestCase):
 
     def test_get_nontip_index(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -130,7 +126,7 @@ class TestSparsify(TestCase):
 
     def test_get_tip_indeces(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -156,7 +152,7 @@ class TestSparsify(TestCase):
 
     def test_get_lstar(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -196,7 +192,7 @@ class TestSparsify(TestCase):
 
     def test_get_L(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -217,7 +213,7 @@ class TestSparsify(TestCase):
 
     def test_get_haarvec(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -251,7 +247,7 @@ class TestSparsify(TestCase):
 
     def test_handle_case(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -375,7 +371,7 @@ class TestSparsify(TestCase):
 
     def test_get_lilmat_and_shl(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         t2, lilmat, shl = initiate_values(t2)
 
         for i, node in enumerate(t2.non_tips(include_self=True)):
@@ -422,7 +418,7 @@ class TestSparsify(TestCase):
 
     def test_sparsify(self):
 
-        _, t2, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         lilmat, shl = sparsify(t2)
 
         expected_lilmat = [[0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
@@ -454,7 +450,7 @@ class TestSparsify(TestCase):
 
     def test_get_lambda(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         lilmat, shl = sparsify(t2)
 
         for i in range(lilmat.shape[0]):
@@ -483,7 +479,7 @@ class TestSparsify(TestCase):
 
     def test_get_lambdas(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         lilmat, shl = sparsify(t2)
 
         diagonal = get_lambdas(lilmat, shl)
@@ -498,8 +494,8 @@ class TestSparsify(TestCase):
         before_obs = self.table.ids(axis='observation')
         assert (before_obs == before_exp).all()
 
-        table, _, _, _ = match_to_tree(self.table, self.tree)
-        table = table.todense()
+        _, table = match_to_tree(self.table, self.tree)
+        table = table.matrix_data.toarray()
 
         after_exp = np.array(
             [[0.0, 0.07142857, 0.0, 0.44444444, 0.05555556],
@@ -515,7 +511,7 @@ class TestSparsify(TestCase):
 
     def test_create_branching_tree(self):
 
-        _, t2, _, _ = match_to_tree(self.table, self.tree)
+        t2, _ = match_to_tree(self.table, self.tree)
         lilmat, shl = sparsify(t2)
 
         lilmat_exp = np.array([[4, 6, 6, 0, 0, 0, 0],
@@ -553,10 +549,12 @@ class TestSparsify(TestCase):
         exp_D = np.array(exp_D)
         exp_modmags = np.array(exp_modmags)
 
-        table, tree, ids, table_matrix = match_to_tree(self.table, self.tree)
+        tree, table = match_to_tree(self.table, self.tree)
         lilmat, shl = sparsify(tree)
         diagonal = get_lambdas(lilmat, shl)
-        D, modmags = compute_haar_dist(table_matrix, shl, diagonal)
+        abund_vec = get_otu_abundances(table, tree)
+        mags = calc_haar_mags(shl, abund_vec)
+        D, modmags = compute_haar_dist(mags, diagonal)
         modmags = modmags.todense()
 
         assert np.isclose(exp_D, D).all()
